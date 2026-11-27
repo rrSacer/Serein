@@ -10,7 +10,7 @@ mod screen;
 #[cfg(target_os = "linux")]
 use screen::{
 	AudioChunk, EncodedFrame, MAX_AUDIO_SAMPLES, MAX_ENCODED_BYTES, MAX_RAW_BYTES, RawFrame,
-	Settings, SourceId, encode_pixels, encoder, preview_frame,
+	Settings, SourceId, encode_pixels_with_max, encoder, encoder_with_max, preview_frame,
 };
 #[cfg(target_os = "linux")]
 #[path = "../src/screen/audio_linux.rs"]
@@ -91,10 +91,12 @@ fn nvenc_exit() {
 				.build()
 				.unwrap();
 			let ready = Arc::new(AtomicBool::new(true));
-			let Ok(pipeline) = Capture::new(
+			let Ok(pipeline) = Capture::new_with_limits(
 				settings,
 				Mode::Nvidia,
 				settings.bit_rate(),
+				settings.bit_rate(),
+				MAX_ENCODED_BYTES,
 				source,
 				worker_stop.clone(),
 				ready,
@@ -182,7 +184,7 @@ fn main() {
 			});
 			linux::timestamp_niri_frames(&source).unwrap();
 		}
-		let pipeline = Capture::new(settings, mode, settings.bit_rate(), source, stop.clone(), ready.clone(), keyframe.clone(), || true).unwrap();
+		let pipeline = Capture::new_with_limits(settings, mode, settings.bit_rate(), settings.bit_rate(), MAX_ENCODED_BYTES, source, stop.clone(), ready.clone(), keyframe.clone(), || true).unwrap();
 		let deadline = Instant::now() + Duration::from_secs(5);
 		let mut previews = 0;
 		let mut last_preview_pts = None;
@@ -234,7 +236,7 @@ fn main() {
 				assert_eq!((raw.width, raw.height), (1280, 720));
 				let mut encoder = encoder(settings, settings.bit_rate()).unwrap();
 				let mut yuv = openh264::formats::YUVBuffer::new(1280, 720);
-				let (data, keyframe) = encode_pixels(&mut encoder, &mut yuv, &raw.data, (1280, 720), true).unwrap();
+				let (data, keyframe) = encode_pixels_with_max(&mut encoder, &mut yuv, &raw.data, (1280, 720), true, MAX_ENCODED_BYTES).unwrap();
 				assert!(keyframe);
 				video::validate_source(&data).unwrap();
 				encoded += 1;

@@ -1,7 +1,7 @@
 //! Linux ownership: one portal session and one bounded media pipeline, no recorder.
 use super::{
-	AudioChunk, EncodedFrame, MAX_ENCODED_BYTES, Settings, SourceId, audio_linux, encode_pixels,
-	encoder,
+	AudioChunk, EncodedFrame, Settings, SourceId, audio_linux, encode_pixels_with_max,
+	encoder_with_max,
 	gstreamer::{self as capture, Capture, Gpu, Mode},
 	portal_linux::Portal,
 	preview_frame,
@@ -124,6 +124,8 @@ pub(super) fn x11_source(cursor: bool) -> Result<gst::Element, &'static str> {
 #[allow(clippy::too_many_arguments)] // The existing worker's bounded media outputs.
 pub(super) fn run(
 	settings: Settings,
+	max_bitrate: u32,
+	max_encoded_bytes: usize,
 	stop: Arc<AtomicBool>,
 	ready: Arc<AtomicBool>,
 	keyframe: Arc<AtomicBool>,
@@ -223,13 +225,16 @@ pub(super) fn run(
 				let probe = source.clone();
 				let capacity = send.clone();
 				keyframe.store(true, Ordering::Release);
+				let effective_max_bitrate = max_bitrate.max(settings.bit_rate());
 				let mut active_bitrate = bitrate
 					.load(Ordering::Acquire)
-					.clamp(250_000, settings.bit_rate());
-				let Ok(pipeline) = Capture::new(
+					.clamp(250_000, effective_max_bitrate);
+				let Ok(pipeline) = Capture::new_with_limits(
 					settings,
 					mode,
 					active_bitrate,
+					effective_max_bitrate,
+					max_encoded_bytes,
 					source,
 					stop.clone(),
 					ready.clone(),
@@ -320,7 +325,7 @@ pub(super) fn run(
 					}
 					let target = bitrate
 						.load(Ordering::Acquire)
-						.clamp(250_000, settings.bit_rate());
+						.clamp(250_000, effective_max_bitrate);
 					// Let startup/recovery reach its existing deadline: changing targets must
 					// not repeatedly restart a failing encoder before fallback can run.
 					if target != active_bitrate && !waiting_keyframe {
@@ -410,7 +415,11 @@ pub(super) fn run(
 								}
 								if software.is_none() {
 									software = Some((
-										encoder(settings, active_bitrate)?,
+										encoder_with_max(
+											settings,
+											active_bitrate,
+											effective_max_bitrate,
+										)?,
 										YUVBuffer::new(
 											settings.width as usize,
 											settings.height as usize,
@@ -420,19 +429,20 @@ pub(super) fn run(
 								let (encoder, yuv) =
 									software.as_mut().expect("software encoder initialized");
 								let start = metrics.start();
-								let encoded = encode_pixels(
+								let encoded = encode_pixels_with_max(
 									encoder,
 									yuv,
 									&raw.data,
 									(settings.width as usize, settings.height as usize),
 									keyframe.swap(false, Ordering::AcqRel) || waiting_keyframe,
+									max_encoded_bytes,
 								)?;
 								metrics.finish(crate::diagnostics::Stage::Encode, start);
 								encoded
 							} else {
 								let buffer =
 									sample.buffer().ok_or("Screen encoder returned no buffer")?;
-								if buffer.size() > MAX_ENCODED_BYTES {
+								if buffer.size() > max_encoded_bytes {
 									return Err("Encoded screen frame exceeds the sharing limit");
 								}
 								let map = buffer

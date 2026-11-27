@@ -18,6 +18,7 @@ pub(crate) type Lost = Arc<Mutex<Vec<u64>>>;
 
 /// Largest reassembled (still DAVE-encrypted) access unit accepted from one remote sender.
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024 + 64 * 1024;
+pub const P2P_MAX_FRAME_BYTES: usize = 6 * 1024 * 1024;
 /// Remote video senders tracked per transport; Discord forwards at most a few at once.
 pub const MAX_SOURCES: usize = 16;
 /// Decoders kept alive at once; each holds reference pictures for one remote user.
@@ -41,8 +42,9 @@ pub type VideoSink = Arc<dyn Fn(RemoteFrame<'_>) + Send + Sync>;
 pub(crate) struct DecoderQueue {
 	send: SyncSender<Decode>,
 	#[cfg(test)]
-	worker: Option<(std::thread::JoinHandle<()>, Receiver<()>)>,
+	worker: Mutex<Option<(std::thread::JoinHandle<()>, Receiver<()>)>>,
 	bytes: Arc<tokio::sync::Semaphore>,
+	max_frame_bytes: usize,
 	// One cancellable lifetime per user; queued frames keep the old lifetime on restart.
 	// This table has at most MAX_SOURCES entries. Old tokens survive only in the
 	// bounded frame queue/worker and decoder callbacks, never an accumulating tombstone list.
@@ -54,7 +56,7 @@ pub(crate) struct DecoderQueue {
 #[cfg(test)]
 impl Drop for DecoderQueue {
 	fn drop(&mut self) {
-		let Some((worker, completed)) = self.worker.take() else {
+		let Some((worker, completed)) = self.worker.get_mut().unwrap().take() else {
 			return;
 		};
 		// Close the queue before waiting: the native decoder is owned by this worker.
@@ -694,7 +696,20 @@ impl Receivers {
 
 /// Decoder thread: cleartext access units in, bounded RGBA frames out through the sink.
 /// Dropping the returned sender ends the thread and releases every decoder.
+pub(crate) fn spawn_p2p_decoder(sink: VideoSink) -> Result<(DecoderQueue, Lost), &'static str> {
+	// Network tests decode without consulting local GStreamer drivers or hardware.
+	spawn_decoder_with_limit(sink, P2P_MAX_FRAME_BYTES, !cfg!(test))
+}
+
 pub(crate) fn spawn_decoder(sink: VideoSink) -> Result<(DecoderQueue, Lost), &'static str> {
+	spawn_decoder_with_limit(sink, MAX_FRAME_BYTES, true)
+}
+
+fn spawn_decoder_with_limit(
+	sink: VideoSink,
+	max_frame_bytes: usize,
+	prefer_hardware: bool,
+) -> Result<(DecoderQueue, Lost), &'static str> {
 	// Keep short bursts, but recover from a fresh keyframe instead of replaying stale video.
 	let (send, receive) = sync_channel(16);
 	let lost: Lost = Arc::new(Mutex::new(Vec::new()));
@@ -706,7 +721,14 @@ pub(crate) fn spawn_decoder(sink: VideoSink) -> Result<(DecoderQueue, Lost), &'s
 	let worker = std::thread::Builder::new()
 		.name("remote-video".into())
 		.spawn(move || {
-			decode_loop(receive, sink, report, thread_counters, true);
+			decode_loop_with_limit(
+				receive,
+				sink,
+				report,
+				thread_counters,
+				prefer_hardware,
+				max_frame_bytes,
+			);
 			// Signal only after every decoder and native runtime has been released.
 			#[cfg(test)]
 			let _ = completed.send(());
@@ -718,8 +740,11 @@ pub(crate) fn spawn_decoder(sink: VideoSink) -> Result<(DecoderQueue, Lost), &'s
 		DecoderQueue {
 			send,
 			#[cfg(test)]
-			worker: Some((worker, completion)),
-			bytes: Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTES)),
+			worker: Mutex::new(Some((worker, completion))),
+			bytes: Arc::new(tokio::sync::Semaphore::new(
+				QUEUE_BYTES.max(max_frame_bytes.saturating_mul(3)),
+			)),
+			max_frame_bytes,
 			active: Mutex::new(HashMap::new()),
 			counters,
 		},
@@ -744,7 +769,8 @@ pub(crate) fn offer_timed(
 	frame: Encoded,
 	presentation: Option<crate::Presentation>,
 ) -> Result<bool, &'static str> {
-	if frame.data.len() > MAX_FRAME_BYTES || frame.data.capacity() > QUEUE_BYTES {
+	let queue_limit = QUEUE_BYTES.max(sender.max_frame_bytes.saturating_mul(3));
+	if frame.data.len() > sender.max_frame_bytes || frame.data.capacity() > queue_limit {
 		return Ok(false);
 	}
 	let Ok(permit) = sender
@@ -1076,6 +1102,7 @@ impl Backend {
 	}
 }
 
+#[cfg(test)]
 fn decode_loop(
 	receive: Receiver<Decode>,
 	sink: VideoSink,
@@ -1083,11 +1110,30 @@ fn decode_loop(
 	counters: Arc<DecoderCounters>,
 	prefer_hardware: bool,
 ) {
+	decode_loop_with_limit(
+		receive,
+		sink,
+		lost,
+		counters,
+		prefer_hardware,
+		MAX_FRAME_BYTES,
+	);
+}
+
+fn decode_loop_with_limit(
+	receive: Receiver<Decode>,
+	sink: VideoSink,
+	lost: Lost,
+	counters: Arc<DecoderCounters>,
+	prefer_hardware: bool,
+	max_frame_bytes: usize,
+) {
 	let mut worker = Worker {
 		sink,
 		lost,
 		counters,
 		prefer_hardware,
+		max_frame_bytes,
 		participants: HashMap::new(),
 		serial: 0,
 		scratch: Vec::new(),
@@ -1126,6 +1172,7 @@ struct Worker {
 	lost: Lost,
 	counters: Arc<DecoderCounters>,
 	prefer_hardware: bool,
+	max_frame_bytes: usize,
 	participants: HashMap<u64, Participant>,
 	/// Correlates native decoder outputs with their inputs' presentation stamps.
 	serial: u64,
@@ -1169,7 +1216,7 @@ impl Worker {
 	) {
 		let counters = &self.counters;
 		let lost = &self.lost;
-		if !lifetime.load(Ordering::Acquire) || frame.data.len() > MAX_FRAME_BYTES {
+		if !lifetime.load(Ordering::Acquire) || frame.data.len() > self.max_frame_bytes {
 			return;
 		}
 		let user = frame.user;
@@ -1515,8 +1562,9 @@ mod tests {
 		(
 			DecoderQueue {
 				send,
-				worker: None,
+				worker: Mutex::new(None),
 				bytes: Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTES)),
+				max_frame_bytes: MAX_FRAME_BYTES,
 				active: Mutex::new(HashMap::new()),
 				counters: Arc::default(),
 			},

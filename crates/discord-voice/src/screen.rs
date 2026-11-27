@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 
 pub const MAX_RAW_BYTES: usize = 3840 * 2160 * 4;
 pub const MAX_ENCODED_BYTES: usize = 2 * 1024 * 1024;
+pub const P2P_MAX_ENCODED_BYTES: usize = 6 * 1024 * 1024;
 
 pub struct RawFrame {
 	pub width: u32,
@@ -132,6 +133,24 @@ impl Worker {
 		settings: Settings,
 		wake: impl Fn() + Send + 'static,
 	) -> Result<(Self, Video), &'static str> {
+		Self::start_with_limits(settings, settings.bit_rate(), MAX_ENCODED_BYTES, wake)
+	}
+
+	pub fn start_p2p(
+		settings: Settings,
+		max_bitrate: u32,
+		wake: impl Fn() + Send + 'static,
+	) -> Result<(Self, Video), &'static str> {
+		let capped = max_bitrate.clamp(250_000, client_core::screen::MAX_P2P_BITRATE_BPS);
+		Self::start_with_limits(settings, capped, P2P_MAX_ENCODED_BYTES, wake)
+	}
+
+	fn start_with_limits(
+		settings: Settings,
+		max_bitrate: u32,
+		max_encoded_bytes: usize,
+		wake: impl Fn() + Send + 'static,
+	) -> Result<(Self, Video), &'static str> {
 		if !settings.valid() || !supported() {
 			return Err("Screen sharing is unavailable for these settings or this platform");
 		}
@@ -140,7 +159,7 @@ impl Worker {
 		let audio_epoch = Arc::new(AtomicU64::new(0));
 		let worker_audio_epoch = audio_epoch.clone();
 		let keyframe = Arc::new(AtomicBool::new(true));
-		let bitrate = Arc::new(AtomicU32::new(settings.bit_rate()));
+		let bitrate = Arc::new(AtomicU32::new(max_bitrate));
 		let worker_bitrate = bitrate.clone();
 		let preview = Arc::new(Mutex::new(None));
 		let worker_preview = preview.clone();
@@ -175,6 +194,8 @@ impl Worker {
 				#[cfg(target_os = "linux")]
 				let result = linux::run(
 					settings,
+					max_bitrate,
+					max_encoded_bytes,
 					worker_stop,
 					worker_ready,
 					worker_keyframe,
@@ -192,6 +213,8 @@ impl Worker {
 				#[cfg(not(target_os = "linux"))]
 				let result = encode_loop(
 					settings,
+					max_bitrate,
+					max_encoded_bytes,
 					worker_stop,
 					worker_ready,
 					worker_keyframe,
@@ -286,6 +309,8 @@ impl Drop for Worker {
 #[allow(clippy::too_many_arguments)] // Media outputs of one explicitly started capture.
 fn encode_loop(
 	settings: Settings,
+	max_bitrate: u32,
+	max_encoded_bytes: usize,
 	stop: Arc<AtomicBool>,
 	ready: Arc<AtomicBool>,
 	keyframe: Arc<AtomicBool>,
@@ -419,11 +444,17 @@ fn encode_loop(
 		if send.capacity() == 0 {
 			continue;
 		}
+		let effective_max = max_bitrate.max(settings.bit_rate());
 		let target = bitrate
 			.load(Ordering::Acquire)
-			.clamp(250_000, settings.bit_rate());
+			.clamp(250_000, effective_max);
 		if encoding.is_none() {
-			encoding = Some(ScreenEncoder::new(settings, target)?);
+			encoding = Some(ScreenEncoder::new(
+				settings,
+				target,
+				effective_max,
+				max_encoded_bytes,
+			)?);
 		}
 		if encoding
 			.as_mut()
@@ -503,17 +534,24 @@ struct ScreenEncoder {
 	hardware: Option<crate::video_encode::hardware::Encoder>,
 	settings: Settings,
 	bitrate: u32,
+	max_bitrate: u32,
+	max_encoded_bytes: usize,
 }
 
 #[cfg(not(target_os = "linux"))]
 impl ScreenEncoder {
-	fn new(settings: Settings, bitrate: u32) -> Result<Self, &'static str> {
+	fn new(
+		settings: Settings,
+		bitrate: u32,
+		max_bitrate: u32,
+		max_encoded_bytes: usize,
+	) -> Result<Self, &'static str> {
 		let config = crate::video_encode::Config {
 			width: settings.width,
 			height: settings.height,
 			fps: settings.fps,
 			bit_rate: bitrate,
-			max_bytes: MAX_ENCODED_BYTES,
+			max_bytes: max_encoded_bytes,
 			profile: crate::video_encode::Profile::Main,
 		};
 		#[cfg(target_os = "macos")]
@@ -525,7 +563,7 @@ impl ScreenEncoder {
 		#[cfg(target_os = "windows")]
 		let hardware = crate::video_encode::hardware::Encoder::new(config).ok();
 		let software = if hardware.is_none() {
-			Some(encoder(settings, bitrate)?)
+			Some(encoder_with_max(settings, bitrate, max_bitrate)?)
 		} else {
 			None
 		};
@@ -536,6 +574,8 @@ impl ScreenEncoder {
 			hardware,
 			settings,
 			bitrate,
+			max_bitrate,
+			max_encoded_bytes,
 		})
 	}
 
@@ -557,13 +597,18 @@ impl ScreenEncoder {
 			if !software_rate_change(self.bitrate, bitrate) {
 				return Ok(false);
 			}
-			self.software = Some(encoder(self.settings, bitrate)?);
+			self.software = Some(encoder_with_max(self.settings, bitrate, self.max_bitrate)?);
 			self.bitrate = bitrate;
 		} else {
 			// Reopen native encoders that refuse a live rate change at the target rate.
 			// Release scarce hardware sessions before requesting their replacement.
 			self.hardware = None;
-			*self = Self::new(self.settings, bitrate)?;
+			*self = Self::new(
+				self.settings,
+				bitrate,
+				self.max_bitrate,
+				self.max_encoded_bytes,
+			)?;
 		}
 		Ok(true)
 	}
@@ -588,7 +633,11 @@ impl ScreenEncoder {
 			// The viewer must restart from a keyframe once the software encoder takes over.
 			self.hardware = None;
 			self.diagnostics.set(None);
-			self.software = Some(encoder(self.settings, self.bitrate)?);
+			self.software = Some(encoder_with_max(
+				self.settings,
+				self.bitrate,
+				self.max_bitrate,
+			)?);
 			self.diagnostics.set(Some(false));
 			software_force = true;
 		}
@@ -602,7 +651,7 @@ impl ScreenEncoder {
 		)?;
 		let (y, chroma) = self.i420.split_at(width * height);
 		let (u, v) = chroma.split_at(width * height / 4);
-		encode_yuv(
+		encode_yuv_with_max(
 			self.software.as_mut().expect("software screen encoder"),
 			&openh264::formats::YUVSlices::new(
 				(y, u, v),
@@ -610,6 +659,7 @@ impl ScreenEncoder {
 				(width, width / 2, width / 2),
 			),
 			software_force,
+			self.max_encoded_bytes,
 		)
 	}
 }
@@ -644,10 +694,19 @@ pub(crate) fn i420_to_nv12(
 	Ok(())
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(super) fn encoder(settings: Settings, bitrate: u32) -> Result<Encoder, &'static str> {
+	encoder_with_max(settings, bitrate, settings.bit_rate())
+}
+
+pub(super) fn encoder_with_max(
+	settings: Settings,
+	bitrate: u32,
+	max_bitrate: u32,
+) -> Result<Encoder, &'static str> {
 	let config = EncoderConfig::new()
 		.bitrate(BitRate::from_bps(
-			bitrate.clamp(250_000, settings.bit_rate()),
+			bitrate.clamp(250_000, max_bitrate.max(settings.bit_rate())),
 		))
 		.max_frame_rate(FrameRate::from_hz(settings.fps as f32))
 		.usage_type(UsageType::ScreenContentRealTime)
@@ -667,22 +726,42 @@ fn encoder_threads() -> u16 {
 	std::thread::available_parallelism().map_or(2, |count| count.get().clamp(2, 8) as u16)
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(super) fn encode_pixels(
+#[cfg(test)]
+fn encode_pixels(
 	encoder: &mut Encoder,
 	yuv: &mut YUVBuffer,
 	pixels: &[u8],
 	dimensions: (usize, usize),
 	force_keyframe: bool,
 ) -> Result<(Vec<u8>, bool), &'static str> {
-	yuv.read_bgra8(BgraSliceU8::new(pixels, dimensions));
-	encode_yuv(encoder, yuv, force_keyframe)
+	encode_pixels_with_max(
+		encoder,
+		yuv,
+		pixels,
+		dimensions,
+		force_keyframe,
+		MAX_ENCODED_BYTES,
+	)
 }
 
-fn encode_yuv(
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn encode_pixels_with_max(
+	encoder: &mut Encoder,
+	yuv: &mut YUVBuffer,
+	pixels: &[u8],
+	dimensions: (usize, usize),
+	force_keyframe: bool,
+	max_encoded_bytes: usize,
+) -> Result<(Vec<u8>, bool), &'static str> {
+	yuv.read_bgra8(BgraSliceU8::new(pixels, dimensions));
+	encode_yuv_with_max(encoder, yuv, force_keyframe, max_encoded_bytes)
+}
+
+fn encode_yuv_with_max(
 	encoder: &mut Encoder,
 	yuv: &impl YUVSource,
 	force_keyframe: bool,
+	max_encoded_bytes: usize,
 ) -> Result<(Vec<u8>, bool), &'static str> {
 	if force_keyframe {
 		encoder.force_intra_frame();
@@ -704,7 +783,7 @@ fn encode_yuv(
 						.ok_or("Screen video encoder returned an invalid NAL")?
 						.len(),
 				)
-				.filter(|length| *length <= MAX_ENCODED_BYTES)
+				.filter(|length| *length <= max_encoded_bytes)
 				.ok_or("Encoded screen frame exceeds the sharing limit; choose a lower quality")?;
 		}
 	}

@@ -221,6 +221,13 @@ downloaded at runtime.
 
 Optional screen sharing adds **screencapturekit 10.0.3** (MIT OR Apache-2.0) on macOS, **windows-capture 2.0.1** (MIT) on Windows and **openh264 / openh264-sys2 0.9.8** (BSD-2-Clause) for source-built Cisco OpenH264 encoding. It reuses **image 0.25.10** (MIT OR Apache-2.0) for bounded scaling. Native frameworks are supplied by the OS. These dependencies stay behind the existing voice feature. Unmodified available license texts and source provenance are retained in `assets/licenses/voice/PROVENANCE.md`; the noted missing binding license text and existing full per-artifact redistribution review remain outstanding.
 
+Direct screen sharing adds **Quinn 0.11.12**, **quinn-proto 0.11.19**,
+**quinn-udp 0.5.16** (MIT OR Apache-2.0), **rustls 0.23.46** (Apache-2.0 OR ISC OR MIT),
+**rustls-webpki 0.103.17** (ISC), **rcgen 0.14.10** (MIT OR Apache-2.0),
+**ring 0.17.14** (Apache-2.0 AND ISC) and **subtle 2.6.1** (BSD-3-Clause).
+Their upstream notices and provenance are in `assets/licenses/voice/`. Direct
+sharing reuses the H.264 and Opus components already used for Discord streams.
+
 Camera sending in the macOS build uses **openh264 0.9.8** and
 **openh264-sys2 0.9.8** (BSD-2-Clause, Ralf Biedert), built locally with the
 `source` feature. The sys crate bundles **Cisco OpenH264 2.6.0**, as identified

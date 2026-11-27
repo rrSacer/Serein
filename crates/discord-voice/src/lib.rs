@@ -7,6 +7,7 @@ mod crypto;
 mod diagnostics;
 mod jitter;
 mod mixer;
+pub mod p2p_stream;
 mod presentation;
 pub mod screen;
 mod stream_audio_receive;

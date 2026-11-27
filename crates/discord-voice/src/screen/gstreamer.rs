@@ -1,5 +1,7 @@
 //! Bounded capture/scale/encode pipeline; also exercised with an offline video source.
-use super::{MAX_ENCODED_BYTES, MAX_RAW_BYTES, RawFrame, Settings};
+#[cfg(test)]
+use super::MAX_ENCODED_BYTES;
+use super::{MAX_RAW_BYTES, RawFrame, Settings};
 use ::gstreamer as gst;
 use gst::prelude::*;
 use gstreamer_app as app;
@@ -120,7 +122,8 @@ impl Drop for Capture {
 impl Capture {
 	/// `source` is either the approved PipeWire node or the offline example's test source.
 	#[allow(clippy::too_many_arguments)] // One pipeline and its existing media gates.
-	pub(super) fn new(
+	#[cfg(test)]
+	fn new(
 		settings: Settings,
 		mode: Mode,
 		bitrate: u32,
@@ -130,10 +133,37 @@ impl Capture {
 		keyframe: Arc<AtomicBool>,
 		has_capacity: impl Fn() -> bool + Send + Sync + 'static,
 	) -> Result<Self, &'static str> {
+		Self::new_with_limits(
+			settings,
+			mode,
+			bitrate,
+			settings.bit_rate(),
+			MAX_ENCODED_BYTES,
+			source,
+			stop,
+			ready,
+			keyframe,
+			has_capacity,
+		)
+	}
+
+	#[allow(clippy::too_many_arguments)] // One pipeline and its existing media gates.
+	pub(super) fn new_with_limits(
+		settings: Settings,
+		mode: Mode,
+		bitrate: u32,
+		max_bitrate: u32,
+		max_encoded_bytes: usize,
+		source: gst::Element,
+		stop: Arc<AtomicBool>,
+		ready: Arc<AtomicBool>,
+		keyframe: Arc<AtomicBool>,
+		has_capacity: impl Fn() -> bool + Send + Sync + 'static,
+	) -> Result<Self, &'static str> {
 		if !settings.valid() {
 			return Err(INVALID);
 		}
-		let bitrate = bitrate.clamp(250_000, settings.bit_rate());
+		let bitrate = bitrate.clamp(250_000, max_bitrate.max(settings.bit_rate()));
 		// A fixed rate keeps the GL mixer from fixating a rate from another tee branch.
 		let size = format!(
 			"width={},height={},pixel-aspect-ratio=1/1,framerate={}/1",
@@ -259,7 +289,7 @@ impl Capture {
 			if mode == Mode::Software {
 				MAX_RAW_BYTES
 			} else {
-				MAX_ENCODED_BYTES
+				max_encoded_bytes
 			},
 			failed.clone(),
 		);
