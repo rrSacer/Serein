@@ -517,13 +517,19 @@ async fn run_p2p_host_with_bind(
 
 	let ip = advertised_host.unwrap_or_else(|| bind_addr.ip().to_string());
 	let tailscale = ip.parse().is_ok_and(is_tailscale_ipv4);
-	let link = P2pTarget {
+	let mut link = P2pTarget {
 		host: ip.clone(),
 		port: local_port,
 		token,
 		fingerprint,
 	}
 	.to_link();
+	if video.settings.width > 0 && video.settings.height > 0 && video.settings.fps > 0 {
+		link.push_str(&format!(
+			"&w={}&h={}&fps={}",
+			video.settings.width, video.settings.height, video.settings.fps
+		));
+	}
 
 	let initial_bps = config
 		.initial_bitrate_bps
@@ -847,6 +853,29 @@ pub async fn run_p2p_viewer(
 	stats: watch::Sender<P2pWatchStats>,
 	wake: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<(), String> {
+	run_p2p_viewer_with_call_audio(
+		target,
+		sink,
+		volume_percent,
+		output_device,
+		None,
+		stats,
+		wake,
+	)
+	.await
+}
+
+/// Connects to a remote `P2pTarget` and routes stream audio either into Serein's active call
+/// playback mixer (`call_audio = Some(...)`) or a standalone `P2pAudioPlayer` (`None`).
+pub async fn run_p2p_viewer_with_call_audio(
+	target: P2pTarget,
+	sink: VideoSink,
+	volume_percent: Arc<AtomicU16>,
+	output_device: Option<String>,
+	call_audio: Option<std::sync::mpsc::SyncSender<crate::PlaybackFrame>>,
+	stats: watch::Sender<P2pWatchStats>,
+	wake: Arc<dyn Fn() + Send + Sync>,
+) -> Result<(), String> {
 	stats.send_modify(|s| {
 		s.state = P2pWatchState::Connecting;
 		s.status = format!("Connecting to {}:{}…", target.host, target.port);
@@ -977,13 +1006,31 @@ pub async fn run_p2p_viewer(
 	let audio_stats = stats.clone();
 	let audio_wake = wake.clone();
 	if has_audio {
+		let push_call_frame = |tx: &std::sync::mpsc::SyncSender<crate::PlaybackFrame>, interleaved: &[f32]| {
+			for chunk in interleaved.as_chunks::<AUDIO_FRAME_FLOATS>().0 {
+				let mut mono = [0.0f32; AUDIO_FRAME_FRAMES];
+				for (i, pair) in chunk.as_chunks::<2>().0.iter().enumerate() {
+					mono[i] = ((pair[0] + pair[1]) * 0.5).clamp(-1.0, 1.0);
+				}
+				let _ = tx.try_send(crate::PlaybackFrame {
+					samples: mono,
+					presentation: None,
+					mixed: false,
+				});
+			}
+		};
 		tasks.spawn(async move {
-			let player = tokio::task::spawn_blocking(move || {
-				P2pAudioPlayer::open(output_device.as_deref(), volume_percent)
-			})
-			.await;
-			let Ok(Ok(mut player)) = player else {
-				return;
+			let mut standalone = if call_audio.is_none() {
+				let player = tokio::task::spawn_blocking(move || {
+					P2pAudioPlayer::open(output_device.as_deref(), volume_percent)
+				})
+				.await;
+				let Ok(Ok(player)) = player else {
+					return;
+				};
+				Some(player)
+			} else {
+				None
 			};
 			let Ok(mut opus_dec) = OpusDecoder::new(48_000, Channels::Stereo) else {
 				return;
@@ -1013,7 +1060,12 @@ pub async fn run_p2p_viewer(
 							if let Ok(decoded_samples) =
 								opus_dec.decode_float(&[], &mut pcm[..AUDIO_FRAME_FLOATS], false)
 							{
-								player.push_interleaved(&pcm[..decoded_samples * 2]);
+								let slice = &pcm[..decoded_samples * 2];
+								if let Some(tx) = &call_audio {
+									push_call_frame(tx, slice);
+								} else if let Some(player) = &mut standalone {
+									player.push_interleaved(slice);
+								}
 							}
 						}
 					}
@@ -1022,7 +1074,12 @@ pub async fn run_p2p_viewer(
 				if let Ok(decoded_samples) =
 					opus_dec.decode_float(&data[AUDIO_HEADER_LEN..], &mut pcm, false)
 				{
-					player.push_interleaved(&pcm[..decoded_samples * 2]);
+					let slice = &pcm[..decoded_samples * 2];
+					if let Some(tx) = &call_audio {
+						push_call_frame(tx, slice);
+					} else if let Some(player) = &mut standalone {
+						player.push_interleaved(slice);
+					}
 				}
 			}
 		});

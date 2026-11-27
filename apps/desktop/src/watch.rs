@@ -1,12 +1,20 @@
-//! Desktop ownership for watching one other participant's screen share. The choice is an
-//! explicit click; frames are decoded off the render thread and never written to disk.
+//! Desktop ownership for watching one other participant's screen share (Discord or P2P) or a
+//! direct `serein-p2p://` invitation. Frames are decoded off the render thread and never written
+//! to disk.
 use crate::gpu_video::Wake;
 use client_core::{Command, Event, State, screen, voice};
-use discord_voice::{Identity, Status};
+use discord_voice::{
+	Identity, Status,
+	p2p_stream::{self, P2pTarget, P2pWatchState, P2pWatchStats},
+};
 use eframe::egui;
 use model::Id;
 use std::{
-	sync::{Arc, Mutex},
+	borrow::Cow,
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicU16, Ordering},
+	},
 	time::{Duration, Instant},
 };
 use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
@@ -15,6 +23,7 @@ use zeroize::Zeroizing;
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(30);
 // Eight UHD YUV pictures plus the displayed picture fit without increasing the item bound.
 const DECODED_BUDGET: usize = 128 * 1024 * 1024;
+const MAX_ENDED_LINKS: usize = 32;
 
 /// Latest stream picture and whether the UI still has to upload it.
 type Slot = Option<(platform::video::Picture, bool)>;
@@ -124,6 +133,28 @@ struct Context {
 	stream_request: u64,
 	streamer: Id,
 }
+
+#[derive(Clone, PartialEq, Eq)]
+enum WatchSource {
+	Discord {
+		generation: u64,
+		channel: Id,
+		request: u64,
+		streamer: Id,
+	},
+	InCallP2p {
+		generation: u64,
+		channel: Id,
+		request: u64,
+		streamer: Id,
+		link: String,
+	},
+	DirectP2p {
+		link: String,
+		label: String,
+	},
+}
+
 struct Pending {
 	context: Context,
 	user: Id,
@@ -135,24 +166,39 @@ struct Pending {
 	server: Option<(voice::Secret, String)>,
 	started: Instant,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Notice {
 	Status(&'static str),
-	Failed(&'static str),
+	Ended,
+	Failed(Cow<'static, str>),
+}
+enum LiveKind {
+	Discord {
+		context: Context,
+		events: watch::Receiver<Option<Notice>>,
+	},
+	P2p {
+		source: WatchSource,
+		events: watch::Receiver<Option<Notice>>,
+		stats: watch::Receiver<P2pWatchStats>,
+		volume: Arc<AtomicU16>,
+		link: String,
+	},
 }
 struct Live {
-	context: Context,
 	task: JoinHandle<()>,
-	events: watch::Receiver<Option<Notice>>,
+	kind: LiveKind,
 	frames: Arc<Mutex<Scheduled>>,
 	wake: Wake,
 }
 
 /// Stores the streamer's pictures and asks for a frame when the next one is due. Only the
 /// picture changes then, so the request is for a paint-only frame.
-fn sink(frames: Arc<Mutex<Scheduled>>, streamer: u64, wake: Wake) -> discord_voice::VideoSink {
+fn sink(frames: Arc<Mutex<Scheduled>>, expected_user: Option<u64>, wake: Wake) -> discord_voice::VideoSink {
 	Arc::new(move |frame: discord_voice::RemoteFrame| {
-		if frame.user != streamer {
+		if let Some(streamer) = expected_user
+			&& frame.user != streamer
+		{
 			return;
 		}
 		let now = Instant::now();
@@ -185,8 +231,8 @@ fn synthetic_stream() -> bool {
 pub(super) struct Watch {
 	pending: Option<Pending>,
 	live: Option<Live>,
-	/// The streamer stopped or Discord failed the view; the state choice is cleared next poll.
-	ended: Option<(ui::design::Level, &'static str)>,
+	/// The streamer stopped or the view failed; cleared on the next poll.
+	ended: Option<(ui::design::Level, Cow<'static, str>, Option<String>)>,
 	sequence: u64,
 	status: &'static str,
 	/// GPU texture behind `ui.voice_stream_view`.
@@ -242,11 +288,34 @@ impl Watch {
 		// Logout stops polling, so release the GPU picture here; disposal waits a frame.
 		self.texture = Default::default();
 	}
-	fn context(&self) -> Option<Context> {
+	fn discord_context(&self) -> Option<Context> {
 		self.pending
 			.as_ref()
 			.map(|pending| pending.context)
-			.or_else(|| self.live.as_ref().map(|live| live.context))
+			.or_else(|| match self.live.as_ref().map(|live| &live.kind) {
+				Some(LiveKind::Discord { context, .. }) => Some(*context),
+				_ => None,
+			})
+	}
+	fn current_source(&self) -> Option<WatchSource> {
+		self.pending
+			.as_ref()
+			.map(|pending| WatchSource::Discord {
+				generation: pending.context.generation,
+				channel: pending.context.channel,
+				request: pending.context.request,
+				streamer: pending.context.streamer,
+			})
+			.or_else(|| match self.live.as_ref().map(|live| &live.kind) {
+				Some(LiveKind::Discord { context, .. }) => Some(WatchSource::Discord {
+					generation: context.generation,
+					channel: context.channel,
+					request: context.request,
+					streamer: context.streamer,
+				}),
+				Some(LiveKind::P2p { source, .. }) => Some(source.clone()),
+				None => None,
+			})
 	}
 	/// Take negotiation secrets before the UI reduces the event. Nothing is persisted.
 	pub fn observe(&mut self, state: &State, event: &mut Event) {
@@ -260,7 +329,7 @@ impl Watch {
 		else {
 			return;
 		};
-		let Some(context) = self.context() else {
+		let Some(context) = self.discord_context() else {
 			return;
 		};
 		if context.generation != state.generation
@@ -291,7 +360,8 @@ impl Watch {
 						(None, Some(_)) => {
 							self.ended = Some((
 								ui::design::Level::Warning,
-								"Discord omitted the stream connection token",
+								Cow::Borrowed("Discord omitted the stream connection token"),
+								None,
 							));
 						}
 					}
@@ -300,11 +370,12 @@ impl Watch {
 			screen::Event::Deleted { reason } => {
 				self.ended = Some((
 					ui::design::Level::Info,
-					reason.unwrap_or("The stream ended"),
+					Cow::Borrowed(reason.unwrap_or("The stream ended")),
+					None,
 				));
 			}
 			screen::Event::Failed(message) => {
-				self.ended = Some((ui::design::Level::Warning, message));
+				self.ended = Some((ui::design::Level::Warning, Cow::Borrowed(message), None));
 			}
 			screen::Event::Viewers(_) => {}
 		}
@@ -318,31 +389,89 @@ impl Watch {
 		call: Option<super::screen::Call<'_>>,
 		audio: Option<std::sync::mpsc::SyncSender<discord_voice::PlaybackFrame>>,
 	) -> Option<Command> {
-		let wanted = state.voice.active.as_ref().and_then(|active| {
+		let mut direct_requested = false;
+		if let Some(request) = ui.p2p_watch_request.take() {
+			match request {
+				Some((link, label)) => {
+					direct_requested = true;
+					ui.p2p_ended_links.retain(|item| item != &link);
+					state.stop_watching();
+					ui.p2p_watch = ui::p2p_cards::DirectWatchState {
+						active: true,
+						link,
+						label,
+						status: "Connecting to P2P stream…".to_owned(),
+						..Default::default()
+					};
+				}
+				None => {
+					ui.p2p_watch = Default::default();
+					if matches!(
+						self.live.as_ref().map(|live| &live.kind),
+						Some(LiveKind::P2p {
+							source: WatchSource::DirectP2p { .. },
+							..
+						})
+					) {
+						self.stop();
+						self.status = "Stopped watching";
+					}
+				}
+			}
+		}
+
+		let in_call_wanted = state.voice.active.as_ref().and_then(|active| {
 			let streamer = active.watching?;
 			// The separate stream transport survives call rekeys and voice resumption.
-			(active.phase != voice::Phase::Failed).then_some((
-				state.generation,
-				active.channel,
-				active.request,
-				streamer,
-			))
+			(active.phase != voice::Phase::Failed).then(|| {
+				let discord_streaming = active
+					.participants
+					.iter()
+					.find(|p| p.user == streamer)
+					.is_some_and(|p| p.streaming);
+				if !discord_streaming
+					&& let Some(ann) = state.p2p_stream_for(active.channel, streamer)
+				{
+					WatchSource::InCallP2p {
+						generation: state.generation,
+						channel: active.channel,
+						request: active.request,
+						streamer,
+						link: ann.link.raw.clone(),
+					}
+				} else {
+					WatchSource::Discord {
+						generation: state.generation,
+						channel: active.channel,
+						request: active.request,
+						streamer,
+					}
+				}
+			})
 		});
-		let current = self.context();
+		if in_call_wanted.is_some() && !direct_requested && ui.p2p_watch.active {
+			ui.p2p_watch = Default::default();
+		}
+		let wanted = in_call_wanted.or_else(|| {
+			ui.p2p_watch.active.then(|| WatchSource::DirectP2p {
+				link: ui.p2p_watch.link.clone(),
+				label: ui.p2p_watch.label.clone(),
+			})
+		});
+
+		let current = self.current_source();
+		let discord_context = self.discord_context();
 		let mut command = None;
 		let synthetic = state.demo && synthetic_stream();
-		if let Some(context) = current
-			&& ((state.demo && !synthetic)
-				|| wanted
-					!= Some((
-						context.generation,
-						context.channel,
-						context.request,
-						context.streamer,
-					))) {
+		if let Some(current_source) = current
+			&& ((state.demo && !synthetic) || wanted.as_ref() != Some(&current_source))
+		{
 			self.stop();
 			self.status = "Stopped watching";
-			if context.generation == state.generation && !state.demo {
+			if let Some(context) = discord_context
+				&& context.generation == state.generation
+				&& !state.demo
+			{
 				command = Some(Command::Voice(voice::Command::StopWatching {
 					channel: context.channel,
 					request: context.request,
@@ -350,18 +479,52 @@ impl Watch {
 				}));
 			}
 		}
-		if let Some((level, message)) = self.ended.take() {
-			let context = self.context();
+		if let Some((level, message, ended_link)) = self.ended.take() {
+			let discord_context = self.discord_context();
+			let was_direct = matches!(
+				self.live.as_ref().map(|live| &live.kind),
+				Some(LiveKind::P2p {
+					source: WatchSource::DirectP2p { .. },
+					..
+				})
+			) || ended_link
+				.as_ref()
+				.is_some_and(|link| ui.p2p_watch.active && ui.p2p_watch.link == *link);
+			let was_in_call = matches!(
+				self.live.as_ref().map(|live| &live.kind),
+				Some(LiveKind::P2p {
+					source: WatchSource::InCallP2p { .. },
+					..
+				})
+			) || discord_context.is_some();
 			self.stop();
-			self.status = message;
+			self.status = "The stream ended";
 			// Said once; the stage keeps no line for a view that already ended.
 			ui.toasts.push(level, message);
-			state.stop_watching();
+			if let Some(link) = ended_link {
+				if !ui.p2p_ended_links.contains(&link) {
+					if ui.p2p_ended_links.len() >= MAX_ENDED_LINKS {
+						ui.p2p_ended_links.remove(0);
+					}
+					ui.p2p_ended_links.push(link.clone());
+				}
+				state.remove_p2p_stream_link(&link);
+			}
+			if was_direct {
+				ui.p2p_watch = Default::default();
+			}
+			if was_in_call {
+				state.stop_watching();
+			}
 			ui.voice_stream_view = None;
 			self.texture = Default::default();
-			ui.voice_stream_status = self.status;
+			ui.voice_stream_status = if wanted.is_some() && !was_direct && !was_in_call {
+				self.status
+			} else {
+				""
+			};
 			return command.or_else(|| {
-				let context = context.filter(|context| context.generation == state.generation)?;
+				let context = discord_context.filter(|context| context.generation == state.generation)?;
 				Some(Command::Voice(voice::Command::StopWatching {
 					channel: context.channel,
 					request: context.request,
@@ -370,6 +533,9 @@ impl Watch {
 			});
 		}
 		if state.demo && !synthetic {
+			if ui.p2p_watch.active {
+				ui.p2p_watch.status = "Offline preview · no stream is received".to_owned();
+			}
 			ui.voice_stream_status = if wanted.is_some() {
 				"Offline preview · no stream is received"
 			} else {
@@ -379,7 +545,12 @@ impl Watch {
 		}
 		#[cfg(feature = "demo")]
 		if synthetic
-			&& let Some((generation, channel, request, streamer)) = wanted
+			&& let Some(WatchSource::Discord {
+				generation,
+				channel,
+				request,
+				streamer,
+			}) = wanted.clone()
 			&& self.live.is_none()
 		{
 			self.sequence = self.sequence.wrapping_add(1);
@@ -393,48 +564,99 @@ impl Watch {
 			self.start_synthetic(runtime, context, ctx);
 		}
 		if !synthetic
-			&& let Some((generation, channel, request, streamer)) = wanted
-			&& self.context().is_none()
+			&& self.current_source().is_none()
 			&& command.is_none()
+			&& let Some(wanted_source) = wanted.clone()
 		{
-			let Some(call) = call.filter(|call| {
-				call.generation == generation && call.channel == channel && call.request == request
-			}) else {
-				ui.voice_stream_status = "Connect the call before watching a stream";
-				return None;
-			};
-			self.sequence = self.sequence.wrapping_add(1);
-			let context = Context {
-				generation,
-				channel,
-				request,
-				stream_request: self.sequence,
-				streamer,
-			};
-			self.pending = Some(Pending {
-				context,
-				user: call.user,
-				peer: call.peer,
-				session: Zeroizing::new(call.session.to_owned()),
-				identity: call.identity,
-				audio,
-				rtc: None,
-				server: None,
-				started: Instant::now(),
-			});
-			self.status = "Requesting the stream…";
-			command = Some(Command::Voice(voice::Command::WatchStream {
-				channel,
-				request,
-				stream_request: context.stream_request,
-				streamer,
-			}));
+			match wanted_source {
+				WatchSource::Discord {
+					generation,
+					channel,
+					request,
+					streamer,
+				} => {
+					let Some(call) = call.filter(|call| {
+						call.generation == generation
+							&& call.channel == channel
+							&& call.request == request
+					}) else {
+						ui.voice_stream_status = "Connect the call before watching a stream";
+						return None;
+					};
+					self.sequence = self.sequence.wrapping_add(1);
+					let context = Context {
+						generation,
+						channel,
+						request,
+						stream_request: self.sequence,
+						streamer,
+					};
+					self.pending = Some(Pending {
+						context,
+						user: call.user,
+						peer: call.peer,
+						session: Zeroizing::new(call.session.to_owned()),
+						identity: call.identity,
+						audio,
+						rtc: None,
+						server: None,
+						started: Instant::now(),
+					});
+					self.status = "Requesting the stream…";
+					command = Some(Command::Voice(voice::Command::WatchStream {
+						channel,
+						request,
+						stream_request: context.stream_request,
+						streamer,
+					}));
+				}
+				WatchSource::InCallP2p {
+					generation,
+					channel,
+					request,
+					..
+				} => {
+					let Some(_call) = call.filter(|call| {
+						call.generation == generation
+							&& call.channel == channel
+							&& call.request == request
+					}) else {
+						ui.voice_stream_status = "Connect the call before watching a stream";
+						return None;
+					};
+					if let Err((error, link)) = self.start_p2p(
+						runtime,
+						wanted_source,
+						audio,
+						ui.voice_output.clone(),
+						ui.voice_stream_volume(),
+						ctx,
+					) {
+						self.ended = Some((ui::design::Level::Warning, error, Some(link)));
+						ctx.request_repaint();
+					}
+				}
+				WatchSource::DirectP2p { .. } => {
+					if let Err((error, link)) = self.start_p2p(
+						runtime,
+						wanted_source,
+						audio,
+						ui.voice_output.clone(),
+						ui.voice_stream_volume(),
+						ctx,
+					) {
+						self.ended = Some((ui::design::Level::Warning, error, Some(link)));
+						ctx.request_repaint();
+					}
+				}
+			}
 		}
 		if let Some(pending) = &self.pending {
 			if pending.started.elapsed() >= SIGNAL_TIMEOUT {
 				self.ended = Some((
 					ui::design::Level::Warning,
-					"Discord did not provide the stream connection; try again",
+					Cow::Borrowed("Discord did not provide the stream connection; try again"),
+					None,
 				));
 				ctx.request_repaint();
 			} else {
@@ -448,19 +670,85 @@ impl Watch {
 		{
 			let pending = self.pending.take().expect("complete stream negotiation");
 			if let Err(error) = self.start(runtime, pending, ctx) {
-				self.ended = Some((ui::design::Level::Warning, error));
+				self.ended = Some((ui::design::Level::Warning, Cow::Borrowed(error), None));
 			}
 		}
 		if let Some(live) = &mut self.live {
-			match *live.events.borrow_and_update() {
-				Some(Notice::Status(status)) => self.status = status,
-				Some(Notice::Failed(error)) => {
-					self.ended = Some((ui::design::Level::Warning, error));
+			let stream_volume = ui.voice_stream_volume();
+			match &mut live.kind {
+				LiveKind::Discord { events, .. } => {
+					match events.borrow_and_update().clone() {
+						Some(Notice::Status(status)) => self.status = status,
+						Some(Notice::Ended) => {
+							self.ended = Some((
+								ui::design::Level::Info,
+								Cow::Borrowed("The stream ended"),
+								None,
+							));
+						}
+						Some(Notice::Failed(error)) => {
+							self.ended = Some((ui::design::Level::Warning, error, None));
+						}
+						None => {}
+					}
+					if live.task.is_finished() && self.ended.is_none() {
+						self.ended = Some((
+							ui::design::Level::Warning,
+							Cow::Borrowed("The stream connection ended"),
+							None,
+						));
+					}
 				}
-				None => {}
-			}
-			if live.task.is_finished() && self.ended.is_none() {
-				self.ended = Some((ui::design::Level::Warning, "The stream connection ended"));
+				LiveKind::P2p {
+					source,
+					events,
+					stats,
+					volume,
+					link,
+				} => {
+					volume.store(stream_volume, Ordering::Relaxed);
+					let p2p_stats = stats.borrow_and_update().clone();
+					self.status = match p2p_stats.state {
+						P2pWatchState::Connecting => "Connecting to P2P stream…",
+						P2pWatchState::Authenticating => "Authenticating P2P session…",
+						P2pWatchState::WaitingVideo => "P2P connected · waiting for keyframe…",
+						P2pWatchState::Watching => "Watching P2P stream",
+						P2pWatchState::Failed => "P2P stream failed",
+					};
+					if matches!(source, WatchSource::DirectP2p { .. }) {
+						ui.p2p_watch.status = p2p_stats.status;
+						ui.p2p_watch.width = p2p_stats.width;
+						ui.p2p_watch.height = p2p_stats.height;
+						ui.p2p_watch.fps = p2p_stats.fps;
+						ui.p2p_watch.bitrate_kbps = p2p_stats.bitrate_kbps;
+						ui.p2p_watch.rtt_ms = p2p_stats.rtt_ms;
+					}
+					match events.borrow_and_update().clone() {
+						Some(Notice::Status(status)) => self.status = status,
+						Some(Notice::Ended) => {
+							self.ended = Some((
+								ui::design::Level::Info,
+								Cow::Borrowed("The P2P stream ended"),
+								Some(link.clone()),
+							));
+						}
+						Some(Notice::Failed(error)) => {
+							self.ended = Some((
+								ui::design::Level::Warning,
+								error,
+								Some(link.clone()),
+							));
+						}
+						None => {}
+					}
+					if live.task.is_finished() && self.ended.is_none() {
+						self.ended = Some((
+							ui::design::Level::Info,
+							Cow::Borrowed("The P2P stream ended"),
+							Some(link.clone()),
+						));
+					}
+				}
 			}
 			// Uploading copies the planes into GPU staging, so it runs under the slot lock
 			// and the decoder keeps refilling the same allocation.
@@ -486,6 +774,72 @@ impl Watch {
 		ui.voice_stream_status = if wanted.is_some() { self.status } else { "" };
 		command
 	}
+
+	fn start_p2p(
+		&mut self,
+		runtime: &Runtime,
+		source: WatchSource,
+		audio: Option<std::sync::mpsc::SyncSender<discord_voice::PlaybackFrame>>,
+		output_device: Option<String>,
+		initial_volume: u16,
+		ctx: &egui::Context,
+	) -> Result<(), (Cow<'static, str>, String)> {
+		let link = match &source {
+			WatchSource::InCallP2p { link, .. } | WatchSource::DirectP2p { link, .. } => {
+				link.clone()
+			}
+			WatchSource::Discord { .. } => unreachable!("Discord source in start_p2p"),
+		};
+		let target = P2pTarget::parse(&link).map_err(|err| (Cow::Borrowed(err), link.clone()))?;
+		let frames = Arc::new(Mutex::new(Scheduled::default()));
+		let pictures = Wake::new(ctx, self.presenter.clone());
+		let video_sink = sink(frames.clone(), None, pictures.clone());
+		let (send, events) = watch::channel(None);
+		let (stats_tx, stats_rx) = watch::channel(P2pWatchStats::default());
+		let volume = Arc::new(AtomicU16::new(initial_volume));
+		let viewer_volume = volume.clone();
+		let wake_task = ctx.clone();
+		let wake_viewer = Arc::new({
+			let wake = ctx.clone();
+			move || wake.request_repaint()
+		});
+		let task = runtime.spawn(async move {
+			let result = p2p_stream::run_p2p_viewer_with_call_audio(
+				target,
+				video_sink,
+				viewer_volume,
+				output_device,
+				audio,
+				stats_tx,
+				wake_viewer,
+			)
+			.await;
+			match result {
+				Ok(()) => {
+					send.send_replace(Some(Notice::Ended));
+				}
+				Err(error) => {
+					send.send_replace(Some(Notice::Failed(Cow::Owned(error))));
+				}
+			}
+			wake_task.request_repaint();
+		});
+		self.status = "Connecting to P2P stream…";
+		self.live = Some(Live {
+			task,
+			kind: LiveKind::P2p {
+				source,
+				events,
+				stats: stats_rx,
+				volume,
+				link,
+			},
+			frames,
+			wake: pictures,
+		});
+		Ok(())
+	}
+
 	fn start(
 		&mut self,
 		runtime: &Runtime,
@@ -508,7 +862,7 @@ impl Watch {
 		};
 		let frames = Arc::new(Mutex::new(Scheduled::default()));
 		let pictures = Wake::new(ctx, self.presenter.clone());
-		let sink = sink(frames.clone(), pending.context.streamer.0, pictures.clone());
+		let sink = sink(frames.clone(), Some(pending.context.streamer.0), pictures.clone());
 		let (send, events) = watch::channel(None);
 		let wake = ctx.clone();
 		let identity = pending.identity;
@@ -536,15 +890,17 @@ impl Watch {
 				})
 				.await;
 			if let Err(error) = result {
-				send.send_replace(Some(Notice::Failed(error)));
+				send.send_replace(Some(Notice::Failed(Cow::Borrowed(error))));
 			}
 			wake.request_repaint();
 		});
 		self.status = "Connecting to the stream…";
 		self.live = Some(Live {
-			context: pending.context,
 			task,
-			events,
+			kind: LiveKind::Discord {
+				context: pending.context,
+				events,
+			},
 			frames,
 			wake: pictures,
 		});
@@ -557,7 +913,7 @@ impl Watch {
 		const SIZE: (u32, u32) = (1920, 1080);
 		let frames = Arc::new(Mutex::new(Scheduled::default()));
 		let wake = Wake::new(ctx, self.presenter.clone());
-		let sink = sink(frames.clone(), context.streamer.0, wake.clone());
+		let sink = sink(frames.clone(), Some(context.streamer.0), wake.clone());
 		let user = context.streamer.0;
 		let task = runtime.spawn(async move {
 			let (width, height) = (SIZE.0 as usize, SIZE.1 as usize);
@@ -592,9 +948,11 @@ impl Watch {
 		});
 		self.status = "Watching the stream";
 		self.live = Some(Live {
-			context,
 			task,
-			events: watch::channel(None).1,
+			kind: LiveKind::Discord {
+				context,
+				events: watch::channel(None).1,
+			},
 			frames,
 			wake,
 		});
@@ -635,9 +993,8 @@ mod tests {
 			let mut watch = Watch {
 				pending: None,
 				live: Some(Live {
-					context,
 					task: runtime.spawn(std::future::pending()),
-					events,
+					kind: LiveKind::Discord { context, events },
 					frames: Arc::new(Mutex::new(Scheduled::default())),
 					wake: Wake::new(&ctx, None),
 				}),

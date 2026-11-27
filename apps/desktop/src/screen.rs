@@ -1,10 +1,14 @@
 //! Desktop ownership for one explicitly requested screen share.
 use client_core::{
 	Command, Event, State,
-	screen::{self, Settings},
+	screen::{self, P2pBitrate, Settings, ShareTransport},
 	voice,
 };
-use discord_voice::{Identity, Status, screen::Worker};
+use discord_voice::{
+	Identity, Status,
+	p2p_stream::{self, P2pHostConfig, P2pHostStats},
+	screen::Worker,
+};
 use eframe::egui;
 use model::Id;
 use std::{
@@ -53,16 +57,24 @@ struct Pending {
 	server: Option<(voice::Secret, String)>,
 	started: Instant,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Notice {
 	Status(&'static str),
-	Failed(&'static str),
+	Failed(Cow<'static, str>),
+}
+struct P2pLive {
+	stats: watch::Receiver<P2pHostStats>,
+	post_to_chat: bool,
+	auto_posted: bool,
+	last_viewers: usize,
+	posted_messages: Vec<(Id, Id)>,
 }
 struct Live {
 	context: Context,
 	worker: Worker,
 	task: JoinHandle<()>,
 	events: watch::Receiver<Option<Notice>>,
+	p2p: Option<P2pLive>,
 }
 struct Closing {
 	context: Context,
@@ -83,6 +95,9 @@ pub(super) struct Screen {
 	retiring: Option<mpsc::Receiver<Result<(), Cow<'static, str>>>>,
 	source_scan: Option<SourceScan>,
 	command: Option<Command>,
+	pending_invite_nonce: Option<(u64, String)>,
+	cleanup_deletes: Vec<(u64, Id, Id)>,
+	cleanup_links: Vec<String>,
 	sequence: u64,
 	/// Owned when it carries a run-time detail such as a Windows error code.
 	status: Cow<'static, str>,
@@ -108,6 +123,16 @@ impl Screen {
 	fn retire_live(&mut self) {
 		if let Some(live) = self.live.take() {
 			live.task.abort();
+			if let Some(p2p) = live.p2p {
+				let link = p2p.stats.borrow().link.clone();
+				if !link.is_empty() {
+					self.cleanup_links.push(link);
+				}
+				for (channel, message) in p2p.posted_messages {
+					self.cleanup_deletes
+						.push((live.context.generation, channel, message));
+				}
+			}
 			self.retiring = Some(live.worker.shutdown());
 		}
 	}
@@ -150,11 +175,12 @@ impl Screen {
 		self.close(context, message);
 	}
 
-	/// Retires the live share, asks Discord to stop the stream, and shows `message`.
+	/// Retires the live share, asks Discord to stop the stream (unless P2P), and shows `message`.
 	fn close(&mut self, context: Context, message: impl Into<Cow<'static, str>>) {
+		let is_p2p = self.live.as_ref().is_some_and(|live| live.p2p.is_some());
 		self.pending = None;
 		self.retire_live();
-		if self.closing.is_none() {
+		if !is_p2p && self.closing.is_none() {
 			self.closing = Some(Closing {
 				context,
 				started: Instant::now(),
@@ -169,8 +195,27 @@ impl Screen {
 		self.status = message.into();
 	}
 
-	/// Take matching stream secrets before core reduction. Nothing is persisted.
+	/// Take matching stream secrets and track posted P2P invites before core reduction.
 	pub fn observe(&mut self, state: &State, event: &mut Event) {
+		if let Event::SendResult { nonce, result } = event
+			&& let Some((expected_generation, expected_nonce)) = &self.pending_invite_nonce
+			&& *expected_generation == state.generation
+			&& expected_nonce == nonce
+		{
+			self.pending_invite_nonce = None;
+			if let Ok(message) = result {
+				if let Some(live) = &mut self.live
+					&& live.context.generation == state.generation
+					&& let Some(p2p) = &mut live.p2p
+				{
+					p2p.posted_messages.push((message.channel, message.id));
+				} else {
+					self.cleanup_deletes
+						.push((state.generation, message.channel, message.id));
+				}
+			}
+			return;
+		}
 		let Event::Voice(voice::Event::Stream {
 			channel,
 			request,
@@ -245,7 +290,7 @@ impl Screen {
 	pub fn poll(
 		&mut self,
 		runtime: &Runtime,
-		state: &State,
+		state: &mut State,
 		ui: &mut ui::MessagingUi,
 		ctx: &egui::Context,
 		call: Option<Call<'_>>,
@@ -261,6 +306,9 @@ impl Screen {
 			if self.context().is_some() || self.live.is_some() {
 				self.stop();
 			}
+			self.pending_invite_nonce = None;
+			self.cleanup_deletes.clear();
+			self.cleanup_links.clear();
 			ui.screen.refresh_requested = false;
 			ui.screen.request = None;
 			ui.screen.busy = false;
@@ -269,6 +317,9 @@ impl Screen {
 			ui.screen.preview = None;
 			ui.screen.preview_paused = false;
 			ui.screen.capture_status = None;
+			ui.screen.p2p_link = None;
+			ui.screen.p2p_stats = None;
+			ui.screen.p2p_post_chat_requested = false;
 			return None;
 		}
 		ui.screen.supported = discord_voice::screen::supported();
@@ -362,11 +413,13 @@ impl Screen {
 		{
 			self.stop();
 		}
-		if let Some(context) = self
-			.pending
-			.as_ref()
-			.map(|pending| pending.context)
-			.or_else(|| self.live.as_ref().map(|live| live.context))
+		let is_p2p = self.live.as_ref().is_some_and(|live| live.p2p.is_some());
+		if !is_p2p
+			&& let Some(context) = self
+				.pending
+				.as_ref()
+				.map(|pending| pending.context)
+				.or_else(|| self.live.as_ref().map(|live| live.context))
 			&& !state.can_stream(context.channel)
 		{
 			self.fail("Screen-share permission was removed; stopping sharing");
@@ -374,7 +427,12 @@ impl Screen {
 
 		if let Some(request) = ui.screen.request.take() {
 			match request {
-				ui::screen::Request::Start(settings) => {
+				ui::screen::Request::Start {
+					settings,
+					transport,
+					bitrate,
+					post_to_chat,
+				} => {
 					let requested = ui.screen.context;
 					let valid = settings
 						.valid()
@@ -383,7 +441,8 @@ impl Screen {
 						.filter(|call| {
 							requested == Some((call.generation, call.channel, call.request))
 								&& state.generation == call.generation
-								&& state.can_stream(call.channel)
+								&& (transport == ShareTransport::P2p
+									|| state.can_stream(call.channel))
 								&& state.voice.active.as_ref().is_some_and(|active| {
 									active.channel == call.channel
 										&& active.request == call.request
@@ -404,23 +463,41 @@ impl Screen {
 							request: call.request,
 							stream_request: self.sequence,
 						};
-						self.pending = Some(Pending {
-							context,
-							settings,
-							user: call.user,
-							peer: call.peer,
-							session: Zeroizing::new(call.session.to_owned()),
-							identity: call.identity.clone(),
-							rtc: None,
-							server: None,
-							started: Instant::now(),
-						});
-						self.status = "Requesting screen-share connection…".into();
-						self.command = Some(Command::Voice(voice::Command::StartStream {
-							channel: context.channel,
-							request: context.request,
-							stream_request: context.stream_request,
-						}));
+						match transport {
+							ShareTransport::Discord => {
+								self.pending = Some(Pending {
+									context,
+									settings,
+									user: call.user,
+									peer: call.peer,
+									session: Zeroizing::new(call.session.to_owned()),
+									identity: call.identity.clone(),
+									rtc: None,
+									server: None,
+									started: Instant::now(),
+								});
+								self.status = "Requesting screen-share connection…".into();
+								self.command = Some(Command::Voice(voice::Command::StartStream {
+									channel: context.channel,
+									request: context.request,
+									stream_request: context.stream_request,
+								}));
+							}
+							ShareTransport::P2p => {
+								if let Err(error) = self.start_p2p(
+									runtime,
+									context,
+									settings,
+									bitrate,
+									post_to_chat,
+									ctx,
+								) {
+									self.status = error.into();
+									self.toast =
+										Some((ui::design::Level::Error, self.status.clone()));
+								}
+							}
+						}
 					} else {
 						self.status = "Screen sharing requires the current connected call".into();
 						self.toast = Some((ui::design::Level::Error, self.status.clone()));
@@ -459,9 +536,9 @@ impl Screen {
 
 		let mut failure: Option<Cow<'static, str>> = None;
 		if let Some(live) = &mut self.live {
-			match *live.events.borrow_and_update() {
+			match live.events.borrow_and_update().clone() {
 				Some(Notice::Status(status)) => self.status = status.into(),
-				Some(Notice::Failed(error)) => failure = Some(error.into()),
+				Some(Notice::Failed(error)) => failure = Some(error),
 				None => {}
 			}
 			if failure.is_none() {
@@ -478,17 +555,13 @@ impl Screen {
 		if let Some(error) = failure {
 			self.fail(error);
 		}
-		ui.screen.sharing = self
+		let captured = self
 			.live
 			.as_ref()
 			.is_some_and(|live| live.worker.captured());
+		ui.screen.sharing = captured;
 		// The worker is live while the Linux system picker is still open.
-		if self
-			.live
-			.as_ref()
-			.is_some_and(|live| live.worker.captured())
-			&& !self.share_cued
-		{
+		if captured && !self.share_cued {
 			self.share_cued = true;
 			let cue = model::notification_preferences::Sound::ScreenShareOn;
 			if ui.notification_options.allows(cue) {
@@ -499,7 +572,7 @@ impl Screen {
 		if self.live.is_none() {
 			self.share_cued = false;
 		}
-		if let Some(live) = &self.live {
+		if let Some(live) = &mut self.live {
 			let on_channel = state.selected == Some(live.context.channel);
 			let shown = on_channel
 				&& ctx.input(|input| input.focused && !input.viewport().minimized.unwrap_or(false));
@@ -521,9 +594,78 @@ impl Screen {
 						Some(ctx.load_texture("local-screen", image, egui::TextureOptions::LINEAR));
 				}
 			}
+
+			if let Some(p2p) = &mut live.p2p {
+				let host_stats = p2p.stats.borrow().clone();
+				if captured && !host_stats.status.is_empty() {
+					self.status = host_stats.status.clone().into();
+				}
+				if captured && host_stats.viewers > p2p.last_viewers && p2p.last_viewers <= 25 {
+					self.viewer_cue = true;
+				}
+				p2p.last_viewers = host_stats.viewers;
+				if captured && !host_stats.link.is_empty() {
+					ui.screen.p2p_link = Some(host_stats.link.clone());
+					ui.screen.p2p_stats = Some(screen::P2pShareStats {
+						link: host_stats.link.clone(),
+						ip: host_stats.ip.clone(),
+						tailscale: host_stats.tailscale,
+						viewers: u32::try_from(host_stats.viewers).unwrap_or(u32::MAX),
+						fps: host_stats.fps,
+						bitrate_kbps: host_stats.bitrate_kbps,
+					});
+					let manual_send = std::mem::take(&mut ui.screen.p2p_post_chat_requested);
+					let want_auto = p2p.post_to_chat && !p2p.auto_posted;
+					if (want_auto || manual_send)
+						&& self.pending_invite_nonce.is_none()
+						&& self.command.is_none()
+					{
+						if let Some(cmd) =
+							state.prepare_send_to_channel(live.context.channel, &host_stats.link)
+						{
+							if let Command::Send { ref nonce, .. } = cmd {
+								self.pending_invite_nonce =
+									Some((live.context.generation, nonce.clone()));
+							}
+							p2p.auto_posted = true;
+							self.command = Some(cmd);
+						} else {
+							p2p.auto_posted = true;
+							if manual_send {
+								self.toast = Some((
+									ui::design::Level::Warning,
+									"Could not send P2P invite to this chat".into(),
+								));
+							}
+						}
+					}
+				} else {
+					ui.screen.p2p_link = None;
+					ui.screen.p2p_stats = None;
+					ui.screen.p2p_post_chat_requested = false;
+				}
+			} else {
+				ui.screen.p2p_link = None;
+				ui.screen.p2p_stats = None;
+				ui.screen.p2p_post_chat_requested = false;
+			}
 		} else {
 			ui.screen.preview = None;
 			ui.screen.preview_paused = false;
+			ui.screen.p2p_link = None;
+			ui.screen.p2p_stats = None;
+			ui.screen.p2p_post_chat_requested = false;
+		}
+
+		for link in self.cleanup_links.drain(..) {
+			state.remove_p2p_stream_link(&link);
+		}
+		self.cleanup_deletes
+			.retain(|(generation, _, _)| *generation == state.generation);
+		if self.command.is_none()
+			&& let Some((_, channel, message)) = self.cleanup_deletes.pop()
+		{
+			self.command = Some(Command::Delete { channel, message });
 		}
 
 		if let Some(closing) = &mut self.closing {
@@ -550,6 +692,59 @@ impl Screen {
 			.and_then(|live| live.worker.capture_status());
 		self.command.take()
 	}
+
+	fn start_p2p(
+		&mut self,
+		runtime: &Runtime,
+		context: Context,
+		settings: Settings,
+		bitrate: P2pBitrate,
+		post_to_chat: bool,
+		ctx: &egui::Context,
+	) -> Result<(), &'static str> {
+		let target_bitrate = bitrate.bps(settings);
+		let wake = ctx.clone();
+		let (worker, video) =
+			Worker::start_p2p(settings, target_bitrate, move || wake.request_repaint())?;
+		let (send, events) = watch::channel(None);
+		let (stats_tx, stats_rx) = watch::channel(P2pHostStats::default());
+		let wake_task = ctx.clone();
+		let wake_host = Arc::new({
+			let wake = ctx.clone();
+			move || wake.request_repaint()
+		});
+		let task = runtime.spawn(async move {
+			let config = P2pHostConfig {
+				initial_bitrate_bps: target_bitrate,
+				..Default::default()
+			};
+			let result = p2p_stream::run_p2p_host(video, config, stats_tx, wake_host).await;
+			match result {
+				Ok(()) => note("p2p_stream_transport_stopped", "ok"),
+				Err(error) => {
+					note("p2p_stream_transport_stopped", &error);
+					send.send_replace(Some(Notice::Failed(error.into())));
+				}
+			}
+			wake_task.request_repaint();
+		});
+		self.status = "Starting P2P screen share…".into();
+		self.live = Some(Live {
+			context,
+			worker,
+			task,
+			events,
+			p2p: Some(P2pLive {
+				stats: stats_rx,
+				post_to_chat,
+				auto_posted: false,
+				last_viewers: 0,
+				posted_messages: Vec::new(),
+			}),
+		});
+		Ok(())
+	}
+
 	fn finish_start(&mut self, runtime: &Runtime, ctx: &egui::Context) {
 		let pending = self.pending.take().expect("complete screen negotiation");
 		let context = pending.context;
@@ -609,7 +804,7 @@ impl Screen {
 				Ok(()) => note("stream_transport_stopped", "ok"),
 				Err(error) => {
 					note("stream_transport_stopped", error);
-					send.send_replace(Some(Notice::Failed(error)));
+					send.send_replace(Some(Notice::Failed(error.into())));
 				}
 			}
 			wake.request_repaint();
@@ -620,6 +815,7 @@ impl Screen {
 			worker,
 			task,
 			events,
+			p2p: None,
 		});
 		Ok(())
 	}
@@ -654,14 +850,19 @@ mod tests {
 			let request = active.request;
 			let mut ui = ui::MessagingUi::default();
 			ui.screen.context = Some((state.generation, channel, request));
-			ui.screen.request = Some(ui::screen::Request::Start(Settings {
-				source: screen::SourceId::Display(1),
-				width: 1280,
-				height: 720,
-				fps: 30,
-				cursor: true,
-				audio: false,
-			}));
+			ui.screen.request = Some(ui::screen::Request::Start {
+				settings: Settings {
+					source: screen::SourceId::Display(1),
+					width: 1280,
+					height: 720,
+					fps: 30,
+					cursor: true,
+					audio: false,
+				},
+				transport: ShareTransport::Discord,
+				bitrate: P2pBitrate::Auto,
+				post_to_chat: false,
+			});
 			let call = Call {
 				generation: state.generation,
 				channel,
@@ -673,7 +874,7 @@ mod tests {
 			};
 			let mut screen = Screen::default();
 			assert!(matches!(
-				screen.poll(&runtime, &state, &mut ui, &ctx, Some(call)),
+				screen.poll(&runtime, &mut state, &mut ui, &ctx, Some(call)),
 				Some(Command::Voice(voice::Command::StartStream { .. }))
 			));
 			assert!(screen.pending.is_some());
@@ -782,7 +983,7 @@ mod tests {
 			identity: Identity::generate(),
 		};
 		assert!(matches!(
-			screen.poll(&runtime, &state, &mut ui, &ctx, Some(call)),
+			screen.poll(&runtime, &mut state, &mut ui, &ctx, Some(call)),
 			Some(Command::Voice(voice::Command::StopStream {
 				stream_request: 8,
 				..
@@ -790,5 +991,75 @@ mod tests {
 		));
 		assert!(ui.screen.busy);
 		assert!(ui.screen.status.contains("permission"));
+	}
+
+	#[test]
+	fn p2p_share_skips_discord_signaling_and_deletes_posted_invite_on_stop() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		let ctx = egui::Context::default();
+		let mut state = test_support::demo_state();
+		state.demo = false;
+		// Even without STREAM permission, P2P invite tracking and cleanup work natively.
+		let context = Context {
+			generation: state.generation,
+			channel: Id(22),
+			request: 3,
+			stream_request: 1,
+		};
+		let (_tx, stats) = watch::channel(P2pHostStats::default());
+		let (_ev_tx, events) = watch::channel(None);
+		let settings = Settings {
+			source: screen::SourceId::Display(1),
+			width: 1280,
+			height: 720,
+			fps: 60,
+			cursor: true,
+			audio: false,
+		};
+		let Ok((worker, _video)) = Worker::start_p2p(settings, 8_000_000, || {}) else {
+			// Headless CI environments without a capture backend can skip live capture construction.
+			return;
+		};
+		let mut screen = Screen {
+			live: Some(Live {
+				context,
+				worker,
+				task: runtime.spawn(std::future::pending()),
+				events,
+				p2p: Some(P2pLive {
+					stats,
+					post_to_chat: true,
+					auto_posted: true,
+					last_viewers: 0,
+					posted_messages: Vec::new(),
+				}),
+			}),
+			pending_invite_nonce: Some((state.generation, "nonce-p2p".to_owned())),
+			..Screen::default()
+		};
+		let mut msg = test_support::message(999, Id(22));
+		msg.content = "serein-p2p://100.64.0.1:45123?t=0123456789abcdef0123456789abcdef&fp=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into();
+		let mut send_event = Event::SendResult {
+			nonce: "nonce-p2p".into(),
+			result: Ok(msg.clone()),
+		};
+		screen.observe(&state, &mut send_event);
+		assert!(screen.pending_invite_nonce.is_none());
+
+		let mut ui = ui::MessagingUi::default();
+		ui.screen.request = Some(ui::screen::Request::Stop);
+		let cmd = screen.poll(&runtime, &mut state, &mut ui, &ctx, None);
+		assert!(matches!(
+			cmd,
+			Some(Command::Delete {
+				channel: Id(22),
+				message: Id(999)
+			})
+		));
+		assert!(screen.closing.is_none());
+		let _ = msg.content.len();
 	}
 }

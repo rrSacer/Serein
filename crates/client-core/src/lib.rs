@@ -842,6 +842,7 @@ pub struct State {
 	pub invite_join: invites::Join,
 	pub guild_creation: guild_creation::Creation,
 	pub voice: voice::State,
+	pub p2p_streams: Vec<screen::P2pAnnouncement>,
 	pub generation: u64,
 	pub auth: auth::AuthState,
 	pub user: Option<User>,
@@ -1081,6 +1082,7 @@ impl Default for State {
 			invite_join: Default::default(),
 			guild_creation: Default::default(),
 			voice: voice::State::default(),
+			p2p_streams: Vec::new(),
 			generation: 1,
 			auth: auth::AuthState::Unauthenticated,
 			user: None,
@@ -1967,6 +1969,78 @@ impl State {
 	/// Queue explicit text without consuming the composer draft or reply target.
 	pub fn prepare_text_send(&mut self, content: &str) -> Option<Command> {
 		self.prepare_message_content(&[], None, true, Some(content), None)
+	}
+	/// Queue explicit text to a specific channel (e.g. a call's voice/DM channel) without
+	/// changing `selected` or consuming any composer draft.
+	pub fn prepare_send_to_channel(&mut self, channel: Id, content: &str) -> Option<Command> {
+		if !self.can_send(channel)
+			|| self
+				.slowmode_remaining(channel, std::time::Instant::now())
+				.is_some()
+			|| !model::message_options::valid(content, self.content_limit(), false)
+			|| self.pending.len() >= 64
+			|| self.draft_bytes() + content.len() + size_of::<Pending>() + 32 > MAX_DRAFT_BYTES
+		{
+			return None;
+		}
+		let content = content.to_owned();
+		self.send_sequence += 1;
+		let epoch = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_millis();
+		let nonce = fingerprint::nonce(epoch, self.send_sequence);
+		self.pending.push(Pending {
+			sticker: None,
+			channel,
+			content: content.clone(),
+			attachments: Vec::new(),
+			nonce: nonce.clone(),
+			delivery: Delivery::Sending,
+			confirmed: None,
+			reply: None,
+		});
+		Some(Command::Send {
+			sticker: None,
+			channel,
+			content,
+			nonce,
+			reply: None,
+		})
+	}
+	pub fn p2p_stream_for(&self, channel: Id, user: Id) -> Option<&screen::P2pAnnouncement> {
+		self.p2p_streams
+			.iter()
+			.find(|entry| entry.channel == channel && entry.user == user)
+	}
+	pub fn remove_p2p_stream_link(&mut self, raw_link: &str) {
+		self.p2p_streams.retain(|entry| entry.link.raw != raw_link);
+	}
+	pub(crate) fn observe_p2p_message(&mut self, message: &Message, from_history: bool) {
+		if from_history {
+			let created_ms = (message.id.0 >> 22).saturating_add(1_420_070_400_000);
+			let now_ms = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_millis() as u64;
+			if now_ms.saturating_sub(created_ms) > 6 * 3600 * 1000 {
+				return;
+			}
+		}
+		let Some(link) = screen::extract_p2p_links(&message.content).into_iter().next() else {
+			return;
+		};
+		self.p2p_streams
+			.retain(|entry| !(entry.channel == message.channel && entry.user == message.author.id));
+		while self.p2p_streams.len() >= screen::MAX_P2P_ANNOUNCEMENTS {
+			self.p2p_streams.remove(0);
+		}
+		self.p2p_streams.push(screen::P2pAnnouncement {
+			channel: message.channel,
+			message_id: message.id,
+			user: message.author.id,
+			link,
+		});
 	}
 	/// Queue an explicit reply without consuming the composer draft or its reply target.
 	pub fn prepare_reply_send(
@@ -3677,6 +3751,7 @@ impl State {
 				self.voice.dm_participants.clear();
 				self.voice.dm_ringing.clear();
 				self.voice.ring_error = None;
+				self.p2p_streams.clear();
 				self.members = None;
 				self.member_search = Default::default();
 				self.clear_profile();
@@ -3762,6 +3837,7 @@ impl State {
 				}
 				for message in &messages {
 					self.record_reply_deletion(message);
+					self.observe_p2p_message(message, true);
 				}
 				self.history_pending = false;
 				if !older
@@ -3874,6 +3950,7 @@ impl State {
 					self.message_actions.observe_content(m.channel, m.id);
 				}
 				self.typing_message(&m);
+				self.observe_p2p_message(&m, false);
 				if let Some(post) = self
 					.channel_index(m.channel)
 					.and_then(|index| self.channels.get_mut(index))
@@ -3955,6 +4032,7 @@ impl State {
 				self.forget_pending_replies(channel, &[id]);
 				// A card must never keep showing a reply that no longer exists.
 				self.thread_previews.forget(channel, &[id]);
+				self.p2p_streams.retain(|entry| !(entry.channel == channel && entry.message_id == id));
 				if let Some(channel) = self
 					.channels
 					.iter_mut()
@@ -3995,6 +4073,7 @@ impl State {
 			Event::DeleteBulk { channel, ids } => {
 				self.parked_replies.forget_targets(channel, &ids);
 				self.thread_previews.forget(channel, &ids);
+				self.p2p_streams.retain(|entry| !(entry.channel == channel && ids.contains(&entry.message_id)));
 				if ids.len() <= 100 {
 					for id in &ids {
 						self.read_state.activity.delete(channel, *id);

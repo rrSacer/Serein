@@ -66,6 +66,9 @@ pub struct TimelineView {
 	pub(super) gif_favorite: Option<model::Gif>,
 	pub(super) invite_requests: Vec<String>,
 	pub(super) invite_action: Option<crate::invites::Action>,
+	pub(super) p2p_watch: crate::p2p_cards::DirectWatchState,
+	pub(super) p2p_ended_links: Vec<String>,
+	pub(super) p2p_action: Option<crate::p2p_cards::WatchAction>,
 	pub(super) edit_started: bool,
 	pub(super) reply_started: bool,
 	pub(super) quick_delete: Option<(Id, Id)>,
@@ -2842,6 +2845,7 @@ impl TimelineView {
 					} else {
 						crate::embeds::estimated_height(&m.embeds)
 							+ crate::invites::estimated_height(m)
+							+ crate::p2p_cards::estimated_height(m)
 					}) + crate::attachments::estimated_height(
 						&m.attachments,
 						(width - 88.0).max(1.0),
@@ -4205,6 +4209,14 @@ impl TimelineView {
 													avatars,
 													&mut self.invite_requests,
 													&mut self.invite_action,
+												);
+												crate::p2p_cards::show(
+													ui,
+													message,
+													state,
+													&self.p2p_watch,
+													&self.p2p_ended_links,
+													&mut self.p2p_action,
 												);
 												surface.exclude(egui::Rect::from_min_max(
 													egui::pos2(ui.max_rect().left(), invite_top),

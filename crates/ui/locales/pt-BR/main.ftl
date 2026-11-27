@@ -2307,6 +2307,46 @@ screen-show-share-screen = Compartilhar tela
 screen-show-share-your-screen = Compartilhe sua tela
 # Context: source_list
 screen-source-list-no-screens-or-windows-are-available-yet = Nenhuma tela ou janela está disponível ainda.
+# Context: body
+screen-body-transport = Modo de transmissão
+# Context: body
+screen-body-transport-p2p = P2P Direto (Tailscale / LAN)
+# Context: body
+screen-body-transport-discord = Discord
+# Context: body
+screen-body-bitrate = Taxa de bits
+# Context: body
+screen-body-p2p-note = Transmissão direta via QUIC, fora da API do Discord. Ideal via Tailscale ou rede local.
+# Context: body
+screen-body-post-p2p-invite = Enviar convite no chat da call
+# Context: body
+screen-body-post-p2p-invite-desc = Publica o link serein-p2p:// no chat desta chamada para quem estiver no Serein assistir com 1 clique.
+# Context: p2p
+p2p-watch-stream = Assistir transmissão
+# Context: p2p
+p2p-watching-stream = Assistindo
+# Context: p2p
+p2p-stop-watching = Parar de assistir
+# Context: p2p
+p2p-stream-ended = Transmissão encerrada
+# Context: p2p
+p2p-card-title = Transmissão de Tela P2P
+# Context: p2p
+p2p-copy-invite = Copiar convite P2P
+# Context: p2p
+p2p-invite-copied = Convite P2P copiado
+# Context: p2p
+p2p-send-in-chat = Enviar convite no chat
+# Context: p2p
+p2p-watch-by-link = Assistir stream P2P por link…
+# Context: p2p
+p2p-watch-dialog-title = Assistir stream P2P
+# Context: p2p
+p2p-watch-dialog-subtitle = Cole um link serein-p2p:// para assistir direto na interface do Serein.
+# Context: p2p
+p2p-watch-dialog-placeholder = serein-p2p://100.x.x.x:...
+# Context: p2p
+p2p-watch-dialog-paste = Colar
 
 ## crates/ui/src/search_filters.rs
 # Context: choices

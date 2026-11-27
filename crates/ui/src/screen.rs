@@ -2,7 +2,8 @@
 use client_core::{
 	State,
 	screen::{
-		Resolution, Settings, Source, SourceId, offered_frame_rates, offered_resolutions, picture,
+		P2pBitrate, P2pShareStats, Resolution, Settings, ShareTransport, Source, SourceId,
+		offered_frame_rates, offered_p2p_frame_rates, offered_resolutions, picture,
 	},
 	voice::Phase,
 };
@@ -10,7 +11,12 @@ use model::Id;
 use std::borrow::Cow;
 
 pub enum Request {
-	Start(Settings),
+	Start {
+		settings: Settings,
+		transport: ShareTransport,
+		bitrate: P2pBitrate,
+		post_to_chat: bool,
+	},
 	Stop,
 }
 
@@ -21,6 +27,7 @@ pub(crate) struct LiveShare {
 	pub title: Option<String>,
 	pub height: u32,
 	pub fps: u32,
+	pub transport: ShareTransport,
 }
 
 pub struct ScreenUi {
@@ -42,6 +49,13 @@ pub struct ScreenUi {
 	pub preview: Option<egui::TextureHandle>,
 	/// The share is running and the local picture is intentionally not updating.
 	pub preview_paused: bool,
+	pub transport: ShareTransport,
+	pub bitrate: P2pBitrate,
+	pub post_to_chat: bool,
+	/// Active `serein-p2p://` invite URL when sharing directly over QUIC.
+	pub p2p_link: Option<String>,
+	pub p2p_stats: Option<P2pShareStats>,
+	pub p2p_post_chat_requested: bool,
 	resolution: Resolution,
 	/// Selection the current resolution was chosen for. `None` until sources arrive.
 	quality_for: Option<SourceId>,
@@ -66,9 +80,15 @@ impl Default for ScreenUi {
 			supported: false,
 			preview: None,
 			preview_paused: false,
+			transport: ShareTransport::P2p,
+			bitrate: P2pBitrate::Auto,
+			post_to_chat: true,
+			p2p_link: None,
+			p2p_stats: None,
+			p2p_post_chat_requested: false,
 			resolution: Resolution::Source,
 			quality_for: None,
-			fps: 30,
+			fps: 60,
 			cursor: true,
 			audio: cfg!(target_os = "macos"),
 		}
@@ -147,19 +167,26 @@ impl ScreenUi {
 			return;
 		}
 		if self.quality_for.is_none() && self.quality_for != self.selected {
-			self.resolution = preferred_resolution(&offered);
+			self.resolution = preferred_resolution(&offered, self.transport);
 		}
 		self.quality_for = self.selected;
 		if !offered.contains(&self.resolution) {
-			self.resolution = preferred_resolution(&offered);
+			self.resolution = preferred_resolution(&offered, self.transport);
 		}
-		let rates: Vec<_> = offered_frame_rates(refresh).collect();
+		let rates: Vec<_> = match self.transport {
+			ShareTransport::P2p => offered_p2p_frame_rates(refresh).collect(),
+			ShareTransport::Discord => offered_frame_rates(refresh).collect(),
+		};
 		if !rates.contains(&self.fps) {
 			self.fps = rates
 				.into_iter()
 				.rev()
 				.find(|fps| *fps <= self.fps)
-				.unwrap_or(30);
+				.unwrap_or(if self.transport == ShareTransport::P2p {
+					60
+				} else {
+					30
+				});
 		}
 	}
 
@@ -198,6 +225,9 @@ impl ScreenUi {
 			self.refresh_requested = false;
 			self.sharing = false;
 			self.started = None;
+			self.p2p_link = None;
+			self.p2p_stats = None;
+			self.p2p_post_chat_requested = false;
 		}
 		if !self.open {
 			return;
@@ -213,14 +243,15 @@ impl ScreenUi {
 		))
 		.width(520.0)
 		.show(ctx, |d| {
-			d.scroll(260.0, |ui| self.body(ui, state));
+			d.scroll(340.0, |ui| self.body(ui, state));
 			d.footer(|ui| {
 				let allowed = !state.demo
 					&& self.supported
 					&& !self.busy && self.settings().is_some()
 					&& state.voice.active.as_ref().is_some_and(|call| {
 						matches!(call.phase, Phase::Connected | Phase::Waiting)
-							&& state.can_stream(call.channel)
+							&& (self.transport == ShareTransport::P2p
+								|| state.can_stream(call.channel))
 					});
 				ui.add_enabled_ui(allowed, |ui| {
 					share = crate::dialog::action(
@@ -245,15 +276,21 @@ impl ScreenUi {
 					.then(|| source.name.clone()),
 				height: settings.height,
 				fps: settings.fps,
+				transport: self.transport,
 			});
-			self.request = Some(Request::Start(settings));
+			self.request = Some(Request::Start {
+				settings,
+				transport: self.transport,
+				bitrate: self.bitrate,
+				post_to_chat: self.post_to_chat,
+			});
 		}
 		if cancel || share {
 			self.open = false;
 		}
 	}
 
-	/// Source list, then the capture options Discord exposes without an entitlement.
+	/// Source list, transport selector, and capture options.
 	fn body(&mut self, ui: &mut egui::Ui, state: &State) {
 		let colors = crate::design::palette(ui);
 		ui.horizontal(|ui| {
@@ -284,11 +321,39 @@ impl ScreenUi {
 		ui.add_space(6.0);
 		egui::ScrollArea::vertical()
 			.id_salt("screen-sources")
-			.max_height(196.0)
+			.max_height(176.0)
 			.show(ui, |ui| self.source_list(ui));
+		ui.add_space(12.0);
+		ui.label(crate::design::eyebrow(
+			ui,
+			crate::i18n::translate("screen-body-transport"),
+			colors.muted,
+		));
+		ui.add_space(6.0);
+		ui.horizontal_wrapped(|ui| {
+			ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+			if segment(
+				ui,
+				"screen-body-transport-p2p",
+				self.transport == ShareTransport::P2p,
+			)
+			.clicked()
+			{
+				self.transport = ShareTransport::P2p;
+			}
+			if segment(
+				ui,
+				"screen-body-transport-discord",
+				self.transport == ShareTransport::Discord,
+			)
+			.clicked()
+			{
+				self.transport = ShareTransport::Discord;
+			}
+		});
 		self.align_quality();
 		let (width, height, refresh) = self.geometry();
-		ui.add_space(14.0);
+		ui.add_space(12.0);
 		ui.label(crate::design::eyebrow(
 			ui,
 			crate::i18n::translate("screen-body-quality"),
@@ -316,17 +381,42 @@ impl ScreenUi {
 		ui.add_space(6.0);
 		ui.horizontal_wrapped(|ui| {
 			ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-			for fps in offered_frame_rates(refresh) {
+			let rates: Vec<u32> = match self.transport {
+				ShareTransport::P2p => offered_p2p_frame_rates(refresh).collect(),
+				ShareTransport::Discord => offered_frame_rates(refresh).collect(),
+			};
+			for fps in rates {
 				if segment(ui, &format!("{fps} fps"), self.fps == fps).clicked() {
 					self.fps = fps;
 				}
 			}
 		});
+		if self.transport == ShareTransport::P2p {
+			ui.add_space(8.0);
+			ui.label(crate::design::eyebrow(
+				ui,
+				crate::i18n::translate("screen-body-bitrate"),
+				colors.muted,
+			));
+			ui.add_space(6.0);
+			ui.horizontal_wrapped(|ui| {
+				ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+				for option in P2pBitrate::ALL {
+					if segment(ui, option.label(), self.bitrate == option).clicked() {
+						self.bitrate = option;
+					}
+				}
+			});
+		}
 		ui.add_space(4.0);
 		ui.add(
 			egui::Label::new(
 				egui::RichText::new(crate::i18n::translate(
-					"screen-body-quality-selection-does-not-require-nitro",
+					if self.transport == ShareTransport::P2p {
+						"screen-body-p2p-note"
+					} else {
+						"screen-body-quality-selection-does-not-require-nitro"
+					},
 				))
 				.size(12.0)
 				.color(colors.muted),
@@ -353,6 +443,15 @@ impl ScreenUi {
 					"screen-body-share-sound-from-other-apps-even-when-sharing-one-window"
 				}),
 				&mut self.audio,
+			);
+		}
+		if self.transport == ShareTransport::P2p {
+			ui.add_space(6.0);
+			crate::design::switch(
+				ui,
+				"screen-body-post-p2p-invite",
+				Some("screen-body-post-p2p-invite-desc"),
+				&mut self.post_to_chat,
 			);
 		}
 		ui.add_space(4.0);
@@ -501,7 +600,14 @@ impl ScreenUi {
 	}
 }
 
-fn preferred_resolution(offered: &[Resolution]) -> Resolution {
+fn preferred_resolution(offered: &[Resolution], transport: ShareTransport) -> Resolution {
+	if transport == ShareTransport::P2p {
+		return offered
+			.iter()
+			.copied()
+			.find(|item| matches!(item, Resolution::Preset { height: 1080, .. }))
+			.unwrap_or(offered[offered.len() - 1]);
+	}
 	if cfg!(target_os = "linux") {
 		offered
 			.iter()
@@ -592,7 +698,7 @@ mod tests {
 		let offered: Vec<_> = offered_resolutions(1280, 720, false).collect();
 		assert_eq!(heights(&offered), [480, 720, 1080, 1440, 2160, 0]);
 		assert_eq!(
-			preferred_resolution(&offered),
+			preferred_resolution(&offered, ShareTransport::Discord),
 			if cfg!(target_os = "linux") {
 				Resolution::Preset {
 					width: 1280,
@@ -600,6 +706,13 @@ mod tests {
 				}
 			} else {
 				Resolution::Source
+			}
+		);
+		assert_eq!(
+			preferred_resolution(&offered, ShareTransport::P2p),
+			Resolution::Preset {
+				width: 1920,
+				height: 1080,
 			}
 		);
 		// The Linux portal is sized after the pick, so it offers them all too.

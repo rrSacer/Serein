@@ -2393,6 +2393,46 @@ screen-show-share-screen = Chia sẻ màn hình
 screen-show-share-your-screen = Chia sẻ màn hình của bạn
 # Context: source_list
 screen-source-list-no-screens-or-windows-are-available-yet = Chưa có màn hình hoặc cửa sổ nào.
+# Context: body
+screen-body-transport = Chế độ phát
+# Context: body
+screen-body-transport-p2p = P2P trực tiếp (Tailscale / LAN)
+# Context: body
+screen-body-transport-discord = Discord
+# Context: body
+screen-body-bitrate = Tốc độ bit
+# Context: body
+screen-body-p2p-note = Luồng QUIC trực tiếp không qua máy chủ Discord. Hoạt động qua Tailscale hoặc LAN.
+# Context: body
+screen-body-post-p2p-invite = Gửi lời mời vào trò chuyện cuộc gọi
+# Context: body
+screen-body-post-p2p-invite-desc = Đăng liên kết serein-p2p:// vào cuộc trò chuyện của cuộc gọi để người dùng Serein xem chỉ với một cú nhấp.
+# Context: p2p
+p2p-watch-stream = Xem luồng
+# Context: p2p
+p2p-watching-stream = Đang xem
+# Context: p2p
+p2p-stop-watching = Dừng xem
+# Context: p2p
+p2p-stream-ended = Luồng đã kết thúc
+# Context: p2p
+p2p-card-title = Chia sẻ màn hình P2P
+# Context: p2p
+p2p-copy-invite = Sao chép lời mời P2P
+# Context: p2p
+p2p-invite-copied = Đã sao chép lời mời P2P vào bảng nhớ tạm
+# Context: p2p
+p2p-send-in-chat = Gửi lời mời vào trò chuyện
+# Context: p2p
+p2p-watch-by-link = Xem qua liên kết P2P…
+# Context: p2p
+p2p-watch-dialog-title = Xem luồng P2P
+# Context: p2p
+p2p-watch-dialog-subtitle = Dán liên kết mời serein-p2p:// để xem trực tiếp trong Serein.
+# Context: p2p
+p2p-watch-dialog-placeholder = serein-p2p://100.x.x.x:...
+# Context: p2p
+p2p-watch-dialog-paste = Dán
 
 ## crates/ui/src/search_filters.rs
 # Context: choices

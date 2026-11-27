@@ -804,16 +804,25 @@ impl ClientState {
 	pub fn watch_stream(&mut self, streamer: Id) -> Option<()> {
 		let own = self.user.as_ref().map(|user| user.id);
 		let call = self.voice.active.as_mut()?;
+		let channel = call.channel;
+		let present = call.participants.iter().any(|p| p.user == streamer);
+		let discord_streaming = call
+			.participants
+			.iter()
+			.any(|p| p.user == streamer && p.streaming);
+		let has_p2p = self
+			.p2p_streams
+			.iter()
+			.any(|entry| entry.channel == channel && entry.user == streamer);
 		if !matches!(call.phase, Phase::Connected | Phase::Waiting)
 			|| call.watching == Some(streamer)
 			|| own == Some(streamer)
-			|| !call
-				.participants
-				.iter()
-				.any(|p| p.user == streamer && p.streaming)
+			|| !present
+			|| (!discord_streaming && !has_p2p)
 		{
 			return None;
 		}
+		let call = self.voice.active.as_mut()?;
 		call.watching = Some(streamer);
 		Some(())
 	}
@@ -1024,7 +1033,13 @@ impl ClientState {
 						}
 						call.participants = participants.clone();
 						if call.watching.is_some_and(|user| {
-							!participants.iter().any(|p| p.user == user && p.streaming)
+							let p2p = self
+								.p2p_streams
+								.iter()
+								.any(|entry| entry.channel == channel && entry.user == user);
+							!participants
+								.iter()
+								.any(|p| p.user == user && (p.streaming || p2p))
 						}) {
 							call.watching = None;
 						}
@@ -1189,7 +1204,19 @@ impl ClientState {
 						..participant
 					});
 				}
-				if call.watching == Some(user) && (channel != Some(call.channel) || !streaming) {
+				let call_channel = call.channel;
+				if channel != Some(call_channel) {
+					self.p2p_streams
+						.retain(|entry| !(entry.channel == call_channel && entry.user == user));
+				}
+				let has_p2p = self
+					.p2p_streams
+					.iter()
+					.any(|entry| entry.channel == call_channel && entry.user == user);
+				if let Some(call) = &mut self.voice.active
+					&& call.watching == Some(user)
+					&& (channel != Some(call.channel) || (!streaming && !has_p2p))
+				{
 					call.watching = None;
 				}
 			}
@@ -1209,7 +1236,15 @@ impl ClientState {
 					{
 						participant.streaming = streaming;
 					}
-					if !streaming && call.watching == Some(user) {
+					let has_p2p = self
+						.p2p_streams
+						.iter()
+						.any(|entry| entry.channel == channel && entry.user == user);
+					if !streaming
+						&& !has_p2p
+						&& let Some(call) = &mut self.voice.active
+						&& call.watching == Some(user)
+					{
 						call.watching = None;
 					}
 				}
@@ -1334,10 +1369,16 @@ impl ClientState {
 				call.server_muted = own.server_muted;
 				call.server_deafened = own.server_deafened;
 			}
-			if call
-				.watching
-				.is_some_and(|w| !call.participants.iter().any(|p| p.user == w && p.streaming))
-			{
+			if call.watching.is_some_and(|w| {
+				let p2p = self
+					.p2p_streams
+					.iter()
+					.any(|entry| entry.channel == call.channel && entry.user == w);
+				!call
+					.participants
+					.iter()
+					.any(|p| p.user == w && (p.streaming || p2p))
+			}) {
 				call.watching = None;
 			}
 			if call.participants.len() > MAX_PARTICIPANTS {
