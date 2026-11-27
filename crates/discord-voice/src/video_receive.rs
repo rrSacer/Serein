@@ -697,16 +697,18 @@ impl Receivers {
 /// Decoder thread: cleartext access units in, bounded RGBA frames out through the sink.
 /// Dropping the returned sender ends the thread and releases every decoder.
 pub(crate) fn spawn_p2p_decoder(sink: VideoSink) -> Result<(DecoderQueue, Lost), &'static str> {
-	spawn_decoder_with_limit(sink, P2P_MAX_FRAME_BYTES)
+	// Network tests decode without consulting local GStreamer drivers or hardware.
+	spawn_decoder_with_limit(sink, P2P_MAX_FRAME_BYTES, !cfg!(test))
 }
 
 pub(crate) fn spawn_decoder(sink: VideoSink) -> Result<(DecoderQueue, Lost), &'static str> {
-	spawn_decoder_with_limit(sink, MAX_FRAME_BYTES)
+	spawn_decoder_with_limit(sink, MAX_FRAME_BYTES, true)
 }
 
 fn spawn_decoder_with_limit(
 	sink: VideoSink,
 	max_frame_bytes: usize,
+	prefer_hardware: bool,
 ) -> Result<(DecoderQueue, Lost), &'static str> {
 	// Keep short bursts, but recover from a fresh keyframe instead of replaying stale video.
 	let (send, receive) = sync_channel(16);
@@ -724,7 +726,7 @@ fn spawn_decoder_with_limit(
 				sink,
 				report,
 				thread_counters,
-				true,
+				prefer_hardware,
 				max_frame_bytes,
 			);
 			// Signal only after every decoder and native runtime has been released.

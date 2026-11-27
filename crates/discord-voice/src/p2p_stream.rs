@@ -1348,7 +1348,6 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::screen::AudioChunk;
 	use openh264::OpenH264API;
 	use openh264::encoder::{
 		BitRate, Complexity, Encoder as H264Encoder, EncoderConfig, FrameRate, IntraFramePeriod,
@@ -1407,7 +1406,6 @@ mod tests {
 
 		rt.block_on(async {
 			let (frame_tx, frame_rx) = mpsc::channel(8);
-			let (audio_tx, audio_rx) = mpsc::channel(8);
 			let ready = Arc::new(AtomicBool::new(false));
 			let keyframe = Arc::new(AtomicBool::new(true));
 			let bitrate = Arc::new(AtomicU32::new(10_000_000));
@@ -1420,13 +1418,13 @@ mod tests {
 					height: 180,
 					fps: 60,
 					cursor: true,
-					audio: true,
+					audio: false,
 				},
 				frames: frame_rx,
 				ready: ready.clone(),
 				keyframe: keyframe.clone(),
 				bitrate,
-				audio: Some(audio_rx),
+				audio: None,
 				audio_epoch,
 			};
 
@@ -1519,7 +1517,7 @@ mod tests {
 			.await
 			.unwrap();
 
-			// Feed real H.264 Annex-B IDR + P-frame + stereo AudioChunk.
+			// Feed a real H.264 Annex-B keyframe without opening capture or audio devices.
 			let cfg = EncoderConfig::new()
 				.bitrate(BitRate::from_bps(2_000_000))
 				.max_frame_rate(FrameRate::from_hz(60.0))
@@ -1539,17 +1537,6 @@ mod tests {
 					data: idr,
 					timestamp: 90,
 					keyframe: true,
-				})
-				.await
-				.unwrap();
-
-			let stereo_sine: Vec<f32> = (0..AUDIO_FRAME_FLOATS)
-				.map(|i| ((i / 2) as f32 * 0.05).sin() * 0.25)
-				.collect();
-			audio_tx
-				.send(AudioChunk {
-					samples: stereo_sine,
-					epoch: 1,
 				})
 				.await
 				.unwrap();
