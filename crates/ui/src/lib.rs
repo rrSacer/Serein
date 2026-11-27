@@ -75,6 +75,7 @@ mod guild_folders;
 mod highlight;
 pub mod icons;
 mod invites;
+pub mod p2p_cards;
 pub mod local_time;
 mod markdown;
 mod member_search;
@@ -518,6 +519,10 @@ pub struct MessagingUi {
 	pub voice_switch_ready: bool,
 	voice_switch: Option<voice::CallSwitch>,
 	pub screen: screen::ScreenUi,
+	pub p2p_watch: p2p_cards::DirectWatchState,
+	pub p2p_watch_request: Option<Option<(String, String)>>,
+	pub p2p_watch_dialog: p2p_cards::WatchDialog,
+	pub p2p_ended_links: Vec<String>,
 	pub voice_camera_available: bool,
 	pub voice_camera_status: &'static str,
 	pub voice_cameras: Vec<(String, String)>,
@@ -6050,6 +6055,7 @@ impl MessagingUi {
 				self.startup_warnings_toasted = (state.generation, warnings);
 				if state.selected.is_none() && self.guild.is_none() {
 					self.call_bar(ui, state, &mut commands, None);
+					self.p2p_direct_stage_bar(ui, state);
 					self.timeline.download.show_status(ui);
 					self.friends_page(ui, state, &mut commands);
 					return;
@@ -6088,6 +6094,7 @@ impl MessagingUi {
 						wide_members,
 					)),
 				);
+				self.p2p_direct_stage_bar(ui, state);
 				self.timeline.download.show_status(ui);
 				let Some(channel) = state.selected else {
 					ui.add_space((ui.available_height() * 0.32).max(24.0));
@@ -6287,6 +6294,8 @@ impl MessagingUi {
 					.then_some(self.reading_preferences.double_click_emoji());
 				self.timeline.instant_scrolling = !self.reading_preferences.smooth_scrolling;
 				self.timeline.extension_actions = self.extensions.message_actions();
+				self.timeline.p2p_watch = self.p2p_watch.clone();
+				self.timeline.p2p_ended_links = self.p2p_ended_links.clone();
 				self.timeline.quick_reactions = Some(self.reaction_picker.quick_reactions(state));
 				let mut seen = std::collections::BTreeSet::new();
 				let author_lookup: Vec<_> = state
@@ -6380,6 +6389,31 @@ impl MessagingUi {
 				self.cancel_upload_requested |= std::mem::take(&mut self.timeline.cancel_upload);
 				if let Some(gif) = self.timeline.gif_favorite.take() {
 					state.toggle_gif_favorite(&gif);
+				}
+				if let Some(action) = self.timeline.p2p_action.take() {
+					match action {
+						p2p_cards::WatchAction::StartInCall(user) => {
+							if state.watch_stream(user).is_some() {
+								self.voice_focus = Some(voice::StageFocus::Stream(user));
+							}
+						}
+						p2p_cards::WatchAction::StopInCall => {
+							state.stop_watching();
+							self.voice_focus = None;
+						}
+						p2p_cards::WatchAction::StartDirect { link, label } => {
+							self.p2p_watch_request = Some(Some((link, label)));
+							if state.voice.active.is_some() {
+								self.voice_focus = Some(voice::StageFocus::P2pDirect);
+							}
+						}
+						p2p_cards::WatchAction::StopDirect => {
+							self.p2p_watch_request = Some(None);
+							if self.voice_focus == Some(voice::StageFocus::P2pDirect) {
+								self.voice_focus = None;
+							}
+						}
+					}
 				}
 				match self.timeline.invite_action.take() {
 					Some(invites::Action::OpenGuild(guild)) if state.guild(guild).is_some() => {
@@ -6584,6 +6618,12 @@ impl MessagingUi {
 			.show(&ctx, state, &mut self.avatars, &mut commands);
 		self.attachment_viewer(&ctx, state);
 		self.screen.show(&ctx, state);
+		if let Some((link, label)) = self.p2p_watch_dialog.show(&ctx) {
+			self.p2p_watch_request = Some(Some((link, label)));
+			if state.voice.active.is_some() {
+				self.voice_focus = Some(voice::StageFocus::P2pDirect);
+			}
+		}
 		if let Some(id) = self.timeline.channel_reference_load.take()
 			&& state.channel(id).is_none()
 			&& state.channel_reference_name(id).is_none()

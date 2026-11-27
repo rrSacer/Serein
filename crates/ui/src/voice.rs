@@ -4,6 +4,7 @@ use crate::{MessagingUi, design};
 use client_core::{
 	Command, State,
 	auth::AuthState,
+	screen::ShareTransport,
 	voice::{Participant, Phase, RosterEntry},
 };
 use egui::RichText;
@@ -55,6 +56,16 @@ impl MessagingUi {
 	/// The fullscreen share's call channel, while it is still the tile the stage would show.
 	fn voice_fullscreen_channel(&self, state: &State) -> Option<Id> {
 		let (focus, _, _, _) = self.voice_fullscreen.as_ref()?;
+		if matches!(focus, StageFocus::P2pDirect) {
+			return self.p2p_watch.active.then_some(
+				state
+					.voice
+					.active
+					.as_ref()
+					.filter(|call| call.phase != Phase::Failed)
+					.map_or(Id(0), |call| call.channel),
+			);
+		}
 		state
 			.voice
 			.active
@@ -69,7 +80,7 @@ impl MessagingUi {
 								|| self.screen.preview_paused)
 						}
 						StageFocus::Stream(user) => call.watching == Some(*user),
-						StageFocus::Participant(_) => false,
+						StageFocus::P2pDirect | StageFocus::Participant(_) => false,
 					}
 			})
 			.map(|call| call.channel)
@@ -104,6 +115,7 @@ impl MessagingUi {
 					StageFocus::Stream(user) => {
 						self.stream_tile(ui, state, rect, channel, user, true)
 					}
+					StageFocus::P2pDirect => self.p2p_direct_tile(ui, rect, true),
 					StageFocus::Participant(_) => unreachable!("validated screen share"),
 				}
 				let button = ui.put(
@@ -128,7 +140,10 @@ impl MessagingUi {
 			});
 		// "Stop watching" inside the fullscreen tile applies now, not after leaving fullscreen.
 		self.apply_watch_request(state);
-		exit |= overlay.should_close() || self.voice_fullscreen_channel(state).is_none();
+		exit |= overlay.should_close()
+			|| self.voice_fullscreen_channel(state).is_none()
+			|| (matches!(focus, StageFocus::P2pDirect)
+				&& matches!(self.p2p_watch_request, Some(None)));
 		if exit {
 			self.exit_voice_fullscreen();
 		}
@@ -774,7 +789,11 @@ impl MessagingUi {
 							"voice-voice-participant-muted-for-you-on-this-device",
 						);
 					}
-					if entry.participant.streaming {
+					let has_p2p = state
+						.p2p_stream_for(entry.channel, entry.participant.user)
+						.is_some();
+					let is_streaming = entry.participant.streaming || has_p2p;
+					if is_streaming {
 						live_badge(ui);
 					}
 					ui.allocate_ui_with_layout(
@@ -792,7 +811,11 @@ impl MessagingUi {
 					);
 				});
 				self.voice_participant_menu(&row, state, entry);
-				if entry.participant.streaming {
+				if entry.participant.streaming
+					|| state
+						.p2p_stream_for(entry.channel, entry.participant.user)
+						.is_some()
+				{
 					self.stream_preview_popup(ui, &row, state, entry);
 				}
 				if let Some(user) = user {
@@ -853,13 +876,16 @@ impl MessagingUi {
 		});
 		let everything_visible = ui.ctx().memory(|memory| memory.everything_is_visible());
 		let open = everything_visible || row.contains_pointer() || over_popup;
+		let p2p_info = state.p2p_stream_for(entry.channel, entry.participant.user);
 		if open {
 			let frame = ui.ctx().cumulative_frame_nr();
-			if !self
-				.stream_preview_open
-				.is_some_and(|(previous, last_frame)| {
-					previous == target && frame <= last_frame.saturating_add(1)
-				}) {
+			if entry.participant.streaming
+				&& !self
+					.stream_preview_open
+					.is_some_and(|(previous, last_frame)| {
+						previous == target && frame <= last_frame.saturating_add(1)
+					})
+			{
 				self.stream_preview_request = Some(target);
 			}
 			self.stream_preview_open = Some((target, frame));
@@ -942,27 +968,57 @@ impl MessagingUi {
 							} else {
 								let (rect, _) = ui.allocate_exact_size(image, egui::Sense::hover());
 								ui.painter().rect_filled(rect, 8, colors.canvas);
-								let preview = state.voice.preview.as_ref().filter(|preview| {
-									(preview.guild, preview.channel, preview.user) == target
-								});
-								if preview.is_some_and(|preview| preview.loading) {
-									ui.put(
+								if !entry.participant.streaming
+									&& let Some(ann) = p2p_info
+								{
+									let transport = if ann.link.tailscale {
+										"Tailscale"
+									} else {
+										"LAN / Direto"
+									};
+									let detail = ann.link.quality_summary().map_or_else(
+										|| format!("P2P · {transport}"),
+										|q| format!("P2P · {q} · {transport}"),
+									);
+									crate::icons::paint(
+										ui.painter(),
+										crate::icons::Icon::ScreenShare,
 										egui::Rect::from_center_size(
-											rect.center(),
-											egui::Vec2::splat(24.0),
+											rect.center() - egui::vec2(0.0, 14.0),
+											egui::Vec2::splat(28.0),
 										),
-										egui::Spinner::new().color(colors.muted),
+										colors.accent,
+									);
+									ui.painter().text(
+										rect.center() + egui::vec2(0.0, 18.0),
+										egui::Align2::CENTER_CENTER,
+										detail,
+										egui::FontId::proportional(13.0),
+										colors.text_strong,
 									);
 								} else {
-									ui.painter().text(
-										rect.center(),
-										egui::Align2::CENTER_CENTER,
-										preview
-											.and_then(|preview| preview.error)
-											.unwrap_or("Preview hidden or unavailable"),
-										egui::FontId::proportional(13.0),
-										colors.muted,
-									);
+									let preview = state.voice.preview.as_ref().filter(|preview| {
+										(preview.guild, preview.channel, preview.user) == target
+									});
+									if preview.is_some_and(|preview| preview.loading) {
+										ui.put(
+											egui::Rect::from_center_size(
+												rect.center(),
+												egui::Vec2::splat(24.0),
+											),
+											egui::Spinner::new().color(colors.muted),
+										);
+									} else {
+										ui.painter().text(
+											rect.center(),
+											egui::Align2::CENTER_CENTER,
+											preview
+												.and_then(|preview| preview.error)
+												.unwrap_or("Preview hidden or unavailable"),
+											egui::FontId::proportional(13.0),
+											colors.muted,
+										);
+									}
 								}
 								rect
 							};
@@ -1076,15 +1132,15 @@ impl MessagingUi {
 		let live = state.voice.roster.iter().any(|entry| {
 			entry.channel == channel
 				&& entry.participant.user == user
-				&& entry.participant.streaming
+				&& (entry.participant.streaming || state.p2p_stream_for(channel, user).is_some())
 		}) || state.voice.active.as_ref().is_some_and(|call| {
 			call.channel == channel
 				&& call.guild.is_none()
 				&& matches!(call.phase, Phase::Connected | Phase::Waiting)
-				&& call
-					.participants
-					.iter()
-					.any(|participant| participant.user == user && participant.streaming)
+				&& call.participants.iter().any(|participant| {
+					participant.user == user
+						&& (participant.streaming || state.p2p_stream_for(channel, user).is_some())
+				})
 		});
 		if !live {
 			self.stream_preview_watch = None;
@@ -1255,13 +1311,16 @@ impl MessagingUi {
 			.active
 			.as_ref()
 			.filter(|call| call.channel == channel && call.phase != Phase::Failed);
-		let mut tiles = Vec::with_capacity(entries.len() + 2);
+		let mut tiles = Vec::with_capacity(entries.len() + 3);
 		if call.is_some_and(|call| {
 			self.screen.context == Some((state.generation, channel, call.request))
 				&& self.screen.busy
 				&& (self.screen.preview.is_some() || self.screen.preview_paused)
 		}) {
 			tiles.push(Tile::LocalScreen);
+		}
+		if call.is_some() && self.p2p_watch.active {
+			tiles.push(Tile::P2pDirect);
 		}
 		// Like Discord, every remote share gets its own box beside its streamer's tile; the
 		// watched one leads, the rest stay previews until someone clicks to watch.
@@ -1276,9 +1335,11 @@ impl MessagingUi {
 				.map(|entry| entry.participant.user)
 				.filter(|user| Some(*user) != watching && Some(*user) != own)
 				.filter(|user| {
-					entries
-						.iter()
-						.any(|entry| entry.participant.user == *user && entry.participant.streaming)
+					entries.iter().any(|entry| {
+						entry.participant.user == *user
+							&& (entry.participant.streaming
+								|| state.p2p_stream_for(channel, *user).is_some())
+					})
 				})
 				.map(Tile::Stream),
 		);
@@ -1293,7 +1354,8 @@ impl MessagingUi {
 		self.stage_tiles(state, channel, &entries)
 			.iter()
 			.any(|tile| {
-				matches!(tile, Tile::Stream(_)) || self.tile_has_video(state, channel, tile)
+				matches!(tile, Tile::Stream(_) | Tile::P2pDirect)
+					|| self.tile_has_video(state, channel, tile)
 			})
 	}
 
@@ -1323,7 +1385,7 @@ impl MessagingUi {
 		self.voice_focus = focus;
 		// A live share turns the avatar-only DM stage into boxed tiles, as in Discord.
 		let video = tiles.iter().any(|tile| {
-			matches!(tile, Tile::Stream(_) | Tile::LocalScreen)
+			matches!(tile, Tile::Stream(_) | Tile::LocalScreen | Tile::P2pDirect)
 				|| self.tile_has_video(state, channel, tile)
 		});
 		let frameless = dm && !video && !state.is_group_dm(channel);
@@ -1433,6 +1495,7 @@ impl MessagingUi {
 	fn tile_has_video(&self, state: &State, channel: Id, tile: &Tile<'_>) -> bool {
 		match tile {
 			Tile::LocalScreen => self.screen.preview.is_some() || self.screen.preview_paused,
+			Tile::P2pDirect => self.p2p_watch.active,
 			Tile::Stream(streamer) => self.watching(state, channel, *streamer),
 			Tile::Participant(entry) => {
 				let own = state
@@ -1483,6 +1546,26 @@ impl MessagingUi {
 				self.screen
 					.capture_status
 					.unwrap_or("Your screen · local preview")
+			}
+			Tile::P2pDirect => {
+				self.p2p_direct_tile(ui, rect, false);
+				egui::Popup::context_menu(&response)
+					.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+					.show(|ui| {
+						self.stream_audio_controls(ui);
+						ui.separator();
+						if ui
+							.button(crate::i18n::translate("p2p-stop-watching"))
+							.clicked()
+						{
+							self.p2p_watch_request = Some(None);
+							if self.voice_focus == Some(StageFocus::P2pDirect) {
+								self.voice_focus = None;
+							}
+							ui.close();
+						}
+					});
+				"P2P stream you are watching"
 			}
 			Tile::Stream(streamer) if has_video => {
 				self.stream_tile(ui, state, rect, channel, *streamer, false);
@@ -1667,12 +1750,71 @@ impl MessagingUi {
 		}
 		// Fullscreen has no call bar, so it keeps its own small audio and stop actions.
 		if overlay {
-			self.stream_overlay_controls(ui, content);
+			self.stream_overlay_controls(ui, content, false);
+		}
+	}
+
+	fn p2p_direct_tile(&mut self, ui: &mut egui::Ui, rect: egui::Rect, overlay: bool) {
+		let content = match &self.voice_stream_view {
+			Some(texture) => {
+				let content = fit_rect(rect, texture.size);
+				ui.put(
+					content,
+					egui::Image::from_texture((texture.id, content.size())).corner_radius(8),
+				);
+				content
+			}
+			None => {
+				ui.painter().rect_filled(rect, 8, TILE_FILL);
+				if rect.height() >= 110.0 {
+					let status = if !self.p2p_watch.status.is_empty() {
+						self.p2p_watch.status.as_str()
+					} else if !self.voice_stream_status.is_empty() {
+						self.voice_stream_status
+					} else {
+						"Connecting to P2P stream…"
+					};
+					let spinner = egui::Rect::from_center_size(
+						rect.center() - egui::vec2(0.0, 18.0),
+						egui::Vec2::splat(24.0),
+					);
+					ui.put(spinner, egui::Spinner::new().color(STAGE_MUTED));
+					ui.painter().text(
+						rect.center() + egui::vec2(0.0, 18.0),
+						egui::Align2::CENTER_CENTER,
+						status,
+						egui::FontId::proportional(13.0),
+						STAGE_MUTED,
+					);
+				}
+				rect
+			}
+		};
+		if content.height() >= 72.0 {
+			let base_label = if self.p2p_watch.label.is_empty() {
+				"P2P"
+			} else {
+				&self.p2p_watch.label
+			};
+			let badge = if self.p2p_watch.fps > 0 || self.p2p_watch.bitrate_kbps > 0 {
+				format!(
+					"{base_label} · {} fps · {:.1} Mbps · {} ms",
+					self.p2p_watch.fps,
+					self.p2p_watch.bitrate_kbps as f64 / 1000.0,
+					self.p2p_watch.rtt_ms
+				)
+			} else {
+				base_label.to_owned()
+			};
+			name_badge(ui, content, &badge, None, self.badge_opacity());
+		}
+		if overlay {
+			self.stream_overlay_controls(ui, content, true);
 		}
 	}
 
 	/// Bottom-right actions over a fullscreen share: stream audio and Stop watching.
-	fn stream_overlay_controls(&mut self, ui: &mut egui::Ui, content: egui::Rect) {
+	fn stream_overlay_controls(&mut self, ui: &mut egui::Ui, content: egui::Rect, direct_p2p: bool) {
 		let height = 40.0;
 		let stop_label = "Stop watching";
 		let font = egui::FontId::new(13.0, design::medium_family(ui.ctx()));
@@ -1729,7 +1871,14 @@ impl MessagingUi {
 			.on_hover_text("Stop receiving this screen share")
 			.clicked()
 		{
-			self.watch_request = Some(None);
+			if direct_p2p {
+				self.p2p_watch_request = Some(None);
+				if self.voice_focus == Some(StageFocus::P2pDirect) {
+					self.voice_focus = None;
+				}
+			} else {
+				self.watch_request = Some(None);
+			}
 		}
 	}
 
@@ -1771,6 +1920,21 @@ impl MessagingUi {
 			egui::FontId::new(font, design::medium_family(ui.ctx())),
 			egui::Color32::WHITE,
 		);
+		if !compact && state.p2p_stream_for(channel, streamer).is_some() {
+			let p2p_pill = egui::Rect::from_min_size(
+				// Place a compact P2P tag beside the LIVE pill.
+				live.right_top() + egui::vec2(6.0, 0.0),
+				egui::vec2(34.0, 20.0),
+			);
+			ui.painter().rect_filled(p2p_pill, 4, colors.accent);
+			ui.painter().text(
+				p2p_pill.center(),
+				egui::Align2::CENTER_CENTER,
+				"P2P",
+				egui::FontId::new(10.0, design::medium_family(ui.ctx())),
+				colors.accent_text,
+			);
+		}
 		let enabled = self.can_watch(state, channel, streamer);
 		if !compact {
 			self.watch_stream_button(ui, rect, name, enabled);
@@ -2014,7 +2178,11 @@ impl MessagingUi {
 		}
 		// Discord's LIVE pill marks a streamer on every tile size; strip tiles get a small one
 		// so it never covers the avatar.
-		if entry.participant.streaming {
+		if entry.participant.streaming
+			|| state
+				.p2p_stream_for(entry.channel, entry.participant.user)
+				.is_some()
+		{
 			let (pill, font) = if compact {
 				(egui::vec2(30.0, 15.0), 9.0)
 			} else {
@@ -3514,20 +3682,21 @@ impl MessagingUi {
 		let focused = self.voice_focus.is_some();
 		let screen_focused = matches!(
 			self.voice_focus,
-			Some(StageFocus::LocalScreen | StageFocus::Stream(_))
+			Some(StageFocus::LocalScreen | StageFocus::Stream(_) | StageFocus::P2pDirect)
 		);
 		// Discord's call bar: microphone and camera with their device menus, then share and
 		// more, then the red action; view actions sit at the right edge.
 		let watched = match self.voice_focus {
-			Some(StageFocus::Stream(user)) if call.watching == Some(user) => Some(user),
-			_ => None,
+			Some(StageFocus::Stream(user)) if call.watching == Some(user) => true,
+			Some(StageFocus::P2pDirect) if self.p2p_watch.active => true,
+			_ => false,
 		};
 		let bar = ui.max_rect();
 		// A narrow stage sheds secondary controls (view toggles, device chevrons, then
 		// share/more) before anything overlaps; mute, camera and hang-up always stay.
 		let actions = 2.0 * 48.0;
 		let essential = 2.0 * 48.0 + BAR_GAP + HANG_UP;
-		let side = [watched.is_some(), focused, screen_focused]
+		let side = [watched, focused, screen_focused]
 			.iter()
 			.filter(|shown| **shown)
 			.count() as f32
@@ -3672,6 +3841,13 @@ impl MessagingUi {
 							deafen_clicked = true;
 							ui.close();
 						}
+						if ui
+							.button(crate::i18n::translate("p2p-watch-by-link"))
+							.clicked()
+						{
+							self.p2p_watch_dialog.launch();
+							ui.close();
+						}
 					});
 			});
 		}
@@ -3679,7 +3855,7 @@ impl MessagingUi {
 		let hang_up = {
 			let (rect, response) =
 				row.allocate_exact_size(egui::vec2(HANG_UP, CONTROL_HEIGHT), egui::Sense::click());
-			let enabled = watched.is_some() || !state.demo;
+			let enabled = watched || !state.demo;
 			let fill = if !enabled {
 				colors.danger.gamma_multiply(0.45)
 			} else if response.hovered() || response.has_focus() {
@@ -3690,7 +3866,7 @@ impl MessagingUi {
 			row.painter().rect_filled(rect, 12, fill);
 			crate::icons::paint(
 				row.painter(),
-				if watched.is_some() {
+				if watched {
 					crate::icons::Icon::Close
 				} else {
 					crate::icons::Icon::HangUp
@@ -3698,7 +3874,7 @@ impl MessagingUi {
 				egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(22.0)),
 				egui::Color32::WHITE,
 			);
-			let label = if watched.is_some() {
+			let label = if watched {
 				"Stop watching".to_owned()
 			} else {
 				crate::i18n::translate_if_key(if phase == Phase::Failed {
@@ -3717,7 +3893,7 @@ impl MessagingUi {
 			})
 		};
 		if hang_up.clicked() {
-			if watched.is_some() {
+			if watched {
 				stop_watching = true;
 			} else {
 				leave = !state.demo;
@@ -3766,7 +3942,7 @@ impl MessagingUi {
 				self.voice_focus_participants = !shown;
 			}
 		}
-		if watched.is_some() && side_shown {
+		if watched && side_shown {
 			let volume = control(
 				&mut view,
 				crate::icons::Icon::Speaker,
@@ -3785,7 +3961,11 @@ impl MessagingUi {
 				.show(|ui| self.stream_audio_controls(ui));
 		}
 		if stop_watching {
-			self.watch_request = Some(None);
+			if self.voice_focus == Some(StageFocus::P2pDirect) {
+				self.p2p_watch_request = Some(None);
+			} else {
+				self.watch_request = Some(None);
+			}
 			self.voice_focus = None;
 		}
 		if camera_clicked && let Some(command) = state.set_call_camera(!camera) {
@@ -3812,7 +3992,8 @@ impl MessagingUi {
 			|| (self.screen.supported
 				&& state.voice.active.as_ref().is_some_and(|call| {
 					matches!(call.phase, Phase::Connected | Phase::Waiting)
-						&& state.can_stream(call.channel)
+						&& (self.screen.transport == ShareTransport::P2p
+							|| state.can_stream(call.channel))
 				}));
 		let label = if self.screen.busy {
 			"Stop sharing"
@@ -4163,14 +4344,35 @@ impl MessagingUi {
 		};
 		let colors = design::palette(ui);
 		let title = share.title.as_deref().unwrap_or("Your screen");
-		let quality = format!("{}p {}FPS", share.height, share.fps);
+		let quality = if share.transport == ShareTransport::P2p {
+			if let Some(stats) = &self.screen.p2p_stats {
+				let net = if stats.tailscale { "Tailscale" } else { "LAN" };
+				format!(
+					"{}p {}FPS · P2P {net} · {}v · {:.1} Mbps",
+					share.height,
+					share.fps,
+					stats.viewers,
+					stats.bitrate_kbps as f64 / 1000.0
+				)
+			} else {
+				format!("{}p {}FPS · P2P", share.height, share.fps)
+			}
+		} else {
+			format!("{}p {}FPS", share.height, share.fps)
+		};
+		let p2p_link = (share.transport == ShareTransport::P2p)
+			.then(|| self.screen.p2p_link.clone())
+			.flatten();
+		let can_send_invite = state.can_send(call.channel);
 		let mut stop = false;
+		let mut copy_clicked = false;
+		let mut send_clicked = false;
 		egui::Frame::new()
 			.inner_margin(egui::Margin::same(8))
 			.show(ui, |ui| {
 				ui.set_width(ui.available_width());
 				ui.horizontal(|ui| {
-					ui.spacing_mut().item_spacing.x = 10.0;
+					ui.spacing_mut().item_spacing.x = 8.0;
 					let (tile, _) =
 						ui.allocate_exact_size(egui::Vec2::splat(40.0), egui::Sense::hover());
 					ui.painter().rect_filled(tile, 8, colors.base);
@@ -4181,6 +4383,7 @@ impl MessagingUi {
 						colors.text_strong,
 					);
 					ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+						ui.spacing_mut().item_spacing.x = 2.0;
 						stop = crate::icons::button(
 							ui,
 							crate::icons::Icon::StopScreenShare,
@@ -4188,6 +4391,24 @@ impl MessagingUi {
 							"Stop streaming",
 						)
 						.clicked();
+						if p2p_link.is_some() {
+							copy_clicked = crate::icons::button(
+								ui,
+								crate::icons::Icon::Copy,
+								28.0,
+								&crate::i18n::translate("p2p-copy-invite"),
+							)
+							.clicked();
+							if can_send_invite {
+								send_clicked = crate::icons::button(
+									ui,
+									crate::icons::Icon::Send,
+									28.0,
+									&crate::i18n::translate("p2p-send-in-chat"),
+								)
+								.clicked();
+							}
+						}
 						ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
 							ui.vertical(|ui| {
 								ui.spacing_mut().item_spacing.y = 0.0;
@@ -4210,10 +4431,142 @@ impl MessagingUi {
 					});
 				});
 			});
+		if copy_clicked && let Some(link) = p2p_link {
+			ui.ctx().copy_text(link);
+			self.toasts.push(
+				design::Level::Info,
+				crate::i18n::translate("p2p-invite-copied"),
+			);
+		}
+		if send_clicked {
+			self.screen.p2p_post_chat_requested = true;
+		}
 		if stop {
 			self.screen.launch(state);
 		}
 		true
+	}
+
+	/// Inline P2P video stage shown in the main pane when watching a `serein-p2p://` stream
+	/// directly outside an active call stage.
+	pub(super) fn p2p_direct_stage_bar(&mut self, ui: &mut egui::Ui, state: &State) {
+		let in_visible_call_stage = self.dm_call_stage(state).is_some()
+			|| state.voice.active.as_ref().is_some_and(|call| {
+				state.selected == Some(call.channel)
+					&& state.channel(call.channel).is_some_and(|c| c.kind == 2)
+					&& (!self.voice_chat_open || ui.available_width() >= 720.0)
+			});
+		if !self.p2p_watch.active || in_visible_call_stage {
+			return;
+		}
+		let colors = design::palette(ui);
+		let collapse_id = egui::Id::unique("p2p-direct-stage-collapsed");
+		let mut collapsed = ui
+			.ctx()
+			.data_mut(|data| *data.get_temp_mut_or_default::<bool>(collapse_id));
+		let title = if self.p2p_watch.label.is_empty() {
+			crate::i18n::translate("p2p-card-title")
+		} else {
+			self.p2p_watch.label.clone()
+		};
+		let detail = if self.p2p_watch.fps > 0 || self.p2p_watch.width > 0 {
+			format!(
+				"{}×{} · {} fps · {:.1} Mbps · {} ms",
+				self.p2p_watch.width,
+				self.p2p_watch.height,
+				self.p2p_watch.fps,
+				self.p2p_watch.bitrate_kbps as f64 / 1000.0,
+				self.p2p_watch.rtt_ms
+			)
+		} else {
+			self.p2p_watch.status.clone()
+		};
+		let expanded_height = (ui.available_height() * 0.48).clamp(200.0, 520.0);
+		egui::Panel::top("p2p-direct-stage")
+			.show_separator_line(false)
+			.frame(
+				egui::Frame::new()
+					.fill(STAGE_FILL)
+					.inner_margin(egui::Margin::symmetric(14, 8)),
+			)
+			.show(ui, |ui| {
+				ui.horizontal(|ui| {
+					ui.spacing_mut().item_spacing.x = 8.0;
+					let (pill_rect, _) =
+						ui.allocate_exact_size(egui::vec2(34.0, 20.0), egui::Sense::hover());
+					ui.painter().rect_filled(pill_rect, 4, colors.accent);
+					ui.painter().text(
+						pill_rect.center(),
+						egui::Align2::CENTER_CENTER,
+						"P2P",
+						egui::FontId::new(10.0, design::medium_family(ui.ctx())),
+						colors.accent_text,
+					);
+					ui.label(design::semibold(ui, &title, 14.0).color(STAGE_TEXT));
+					if !detail.is_empty() {
+						ui.label(RichText::new(&detail).size(12.0).color(STAGE_MUTED));
+					}
+					ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+						ui.spacing_mut().item_spacing.x = 4.0;
+						if crate::icons::button(
+							ui,
+							crate::icons::Icon::Close,
+							28.0,
+							&crate::i18n::translate("p2p-stop-watching"),
+						)
+						.clicked()
+						{
+							self.p2p_watch_request = Some(None);
+							if self.voice_focus == Some(StageFocus::P2pDirect) {
+								self.voice_focus = None;
+							}
+						}
+						let toggle_icon = if collapsed {
+							crate::icons::Icon::ArrowDown
+						} else {
+							crate::icons::Icon::ArrowUp
+						};
+						if crate::icons::button(ui, toggle_icon, 28.0, "Toggle video").clicked() {
+							collapsed = !collapsed;
+							ui.ctx().data_mut(|data| data.insert_temp(collapse_id, collapsed));
+						}
+						let fs = crate::icons::button(
+							ui,
+							crate::icons::Icon::Fullscreen,
+							28.0,
+							"Fullscreen",
+						);
+						if fs.clicked() {
+							let previous =
+								ui.input(|input| input.viewport().fullscreen.unwrap_or(false));
+							self.voice_fullscreen = Some((
+								StageFocus::P2pDirect,
+								ui.ctx().clone(),
+								previous,
+								fs.id,
+							));
+							self.voice_fullscreen_request = Some(true);
+						}
+						let vol = crate::icons::button(
+							ui,
+							crate::icons::Icon::Speaker,
+							28.0,
+							"Stream audio",
+						);
+						egui::Popup::menu(&vol)
+							.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+							.show(|ui| self.stream_audio_controls(ui));
+					});
+				});
+				if !collapsed {
+					ui.add_space(6.0);
+					let (video_rect, _) = ui.allocate_exact_size(
+						egui::vec2(ui.available_width().max(120.0), expanded_height),
+						egui::Sense::hover(),
+					);
+					self.p2p_direct_tile(ui, video_rect, false);
+				}
+			});
 	}
 
 	/// Call details drawn inside the account card while connected: Discord's "Voice
@@ -4385,7 +4738,8 @@ impl MessagingUi {
 				let can_share = self.screen.busy
 					|| state.demo || (self.screen.supported
 					&& matches!(phase, Phase::Connected | Phase::Waiting)
-					&& state.can_stream(channel_id));
+					&& (self.screen.transport == ShareTransport::P2p
+						|| state.can_stream(channel_id)));
 				let processing = !state.demo && self.voice_available;
 				let mut camera_clicked = false;
 				let mut share_clicked = false;
@@ -4591,12 +4945,14 @@ pub enum StageFocus {
 	LocalScreen,
 	Stream(Id),
 	Participant(Id),
+	P2pDirect,
 }
 
 enum Tile<'a> {
 	LocalScreen,
 	Stream(Id),
 	Participant(&'a RosterEntry),
+	P2pDirect,
 }
 impl Tile<'_> {
 	fn focus(&self) -> StageFocus {
@@ -4604,6 +4960,7 @@ impl Tile<'_> {
 			Self::LocalScreen => StageFocus::LocalScreen,
 			Self::Stream(streamer) => StageFocus::Stream(*streamer),
 			Self::Participant(entry) => StageFocus::Participant(entry.participant.user),
+			Self::P2pDirect => StageFocus::P2pDirect,
 		}
 	}
 	/// Stable interaction identity, so a tile keeps its hover while the layout changes.
@@ -4612,6 +4969,7 @@ impl Tile<'_> {
 			StageFocus::LocalScreen => (0, 0),
 			StageFocus::Stream(user) => (1, user.0),
 			StageFocus::Participant(user) => (2, user.0),
+			StageFocus::P2pDirect => (3, 0),
 		}
 	}
 }
@@ -6748,6 +7106,7 @@ mod tests {
 			title: None,
 			height: 720,
 			fps: 60,
+			transport: client_core::screen::ShareTransport::Discord,
 		});
 		let ctx = egui::Context::default();
 		let drawn = |messaging: &mut MessagingUi| {

@@ -2387,6 +2387,46 @@ screen-show-share-screen = Share Screen
 screen-show-share-your-screen = Share your screen
 # Context: source_list
 screen-source-list-no-screens-or-windows-are-available-yet = No screens or windows are available yet.
+# Context: body
+screen-body-transport = Stream mode
+# Context: body
+screen-body-transport-p2p = Direct P2P (Tailscale / LAN)
+# Context: body
+screen-body-transport-discord = Discord
+# Context: body
+screen-body-bitrate = Bitrate
+# Context: body
+screen-body-p2p-note = Direct QUIC stream outside Discord's servers. Works over Tailscale or LAN.
+# Context: body
+screen-body-post-p2p-invite = Send invite in call chat
+# Context: body
+screen-body-post-p2p-invite-desc = Posts the serein-p2p:// link in this call's chat so Serein users can watch in one click.
+# Context: p2p
+p2p-watch-stream = Watch Stream
+# Context: p2p
+p2p-watching-stream = Watching
+# Context: p2p
+p2p-stop-watching = Stop watching
+# Context: p2p
+p2p-stream-ended = Stream ended
+# Context: p2p
+p2p-card-title = P2P Screen Share
+# Context: p2p
+p2p-copy-invite = Copy P2P invite
+# Context: p2p
+p2p-invite-copied = P2P invite copied to clipboard
+# Context: p2p
+p2p-send-in-chat = Send invite in chat
+# Context: p2p
+p2p-watch-by-link = Watch P2P link…
+# Context: p2p
+p2p-watch-dialog-title = Watch P2P stream
+# Context: p2p
+p2p-watch-dialog-subtitle = Paste a serein-p2p:// invite link to watch directly in Serein.
+# Context: p2p
+p2p-watch-dialog-placeholder = serein-p2p://100.x.x.x:...
+# Context: p2p
+p2p-watch-dialog-paste = Paste
 
 ## crates/ui/src/search_filters.rs
 # Context: choices

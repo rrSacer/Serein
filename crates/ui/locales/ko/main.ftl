@@ -2349,6 +2349,46 @@ screen-show-share-screen = 화면 공유
 screen-show-share-your-screen = 화면 공유하기
 # Context: source_list
 screen-source-list-no-screens-or-windows-are-available-yet = 아직 사용 가능한 화면이나 창이 없습니다.
+# Context: body
+screen-body-transport = 스트림 방식
+# Context: body
+screen-body-transport-p2p = 직접 P2P (Tailscale / LAN)
+# Context: body
+screen-body-transport-discord = Discord
+# Context: body
+screen-body-bitrate = 비트레이트
+# Context: body
+screen-body-p2p-note = Discord 서버를 거치지 않는 직접 QUIC 스트림입니다. Tailscale 또는 LAN에서 작동합니다.
+# Context: body
+screen-body-post-p2p-invite = 통화 채팅에 초대 링크 보내기
+# Context: body
+screen-body-post-p2p-invite-desc = Serein 사용자가 한 번의 클릭으로 시청할 수 있도록 이 통화 채팅에 serein-p2p:// 링크를 게시합니다.
+# Context: p2p
+p2p-watch-stream = 스트림 시청
+# Context: p2p
+p2p-watching-stream = 시청 중
+# Context: p2p
+p2p-stop-watching = 시청 중지
+# Context: p2p
+p2p-stream-ended = 스트림 종료됨
+# Context: p2p
+p2p-card-title = P2P 화면 공유
+# Context: p2p
+p2p-copy-invite = P2P 초대 복사
+# Context: p2p
+p2p-invite-copied = P2P 초대가 클립보드에 복사되었습니다
+# Context: p2p
+p2p-send-in-chat = 채팅으로 초대 보내기
+# Context: p2p
+p2p-watch-by-link = 링크로 P2P 시청…
+# Context: p2p
+p2p-watch-dialog-title = P2P 스트림 시청
+# Context: p2p
+p2p-watch-dialog-subtitle = Serein에서 바로 시청하려면 serein-p2p:// 초대 링크를 붙여넣으세요.
+# Context: p2p
+p2p-watch-dialog-placeholder = serein-p2p://100.x.x.x:...
+# Context: p2p
+p2p-watch-dialog-paste = 붙여넣기
 
 ## crates/ui/src/search_filters.rs
 # Context: choices

@@ -1,9 +1,11 @@
 //! Bounded screen-share settings and ephemeral Gateway negotiation events.
 use crate::voice;
 use model::Id;
+use std::net::Ipv4Addr;
 
 pub const MAX_SOURCES: usize = 64;
 pub const MAX_SOURCE_NAME_BYTES: usize = 256;
+pub const MAX_P2P_ANNOUNCEMENTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceId {
@@ -104,6 +106,14 @@ pub fn offered_p2p_frame_rates(refresh_hz: u32) -> impl Iterator<Item = u32> {
 		.filter(move |fps| refresh_hz == 0 || *fps <= 60 || refresh_hz >= *fps)
 }
 
+/// Transport chosen inside the native screen-share dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShareTransport {
+	#[default]
+	P2p,
+	Discord,
+}
+
 /// Bitrate ceiling offered for direct P2P streaming.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum P2pBitrate {
@@ -147,6 +157,138 @@ impl P2pBitrate {
 			Self::Mbps60 => "60 Mbps",
 		}
 	}
+}
+
+/// Live telemetry for an active P2P host share displayed in Serein's native UI.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct P2pShareStats {
+	pub link: String,
+	pub ip: String,
+	pub tailscale: bool,
+	pub viewers: u32,
+	pub fps: u32,
+	pub bitrate_kbps: u32,
+}
+
+/// Parsed metadata from a `serein-p2p://` invite URL without opening any socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct P2pLinkInfo {
+	pub raw: String,
+	pub host: String,
+	pub port: u16,
+	pub tailscale: bool,
+	pub width: Option<u32>,
+	pub height: Option<u32>,
+	pub fps: Option<u32>,
+}
+
+impl P2pLinkInfo {
+	pub fn quality_summary(&self) -> Option<String> {
+		match (self.height, self.fps) {
+			(Some(h), Some(fps)) => Some(format!("{h}p {fps}fps")),
+			(Some(h), None) => Some(format!("{h}p")),
+			(None, Some(fps)) => Some(format!("{fps} fps")),
+			(None, None) => None,
+		}
+	}
+}
+
+/// Active P2P stream announcement observed from a call participant's chat message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct P2pAnnouncement {
+	pub channel: Id,
+	pub message_id: Id,
+	pub user: Id,
+	pub link: P2pLinkInfo,
+}
+
+fn is_tailscale_ipv4(ip: Ipv4Addr) -> bool {
+	let octets = ip.octets();
+	octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000
+}
+
+fn is_hex(s: &str, expected_len: usize) -> bool {
+	s.len() == expected_len && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Parses a `serein-p2p://host:port?t=<32hex>&fp=<64hex>[&w=..&h=..&fps=..]` link.
+pub fn parse_p2p_link(input: &str) -> Option<P2pLinkInfo> {
+	let trimmed = input
+		.trim()
+		.trim_matches(|c: char| matches!(c, '<' | '>' | '"' | '\'' | ',' | '.' | ')'));
+	let prefix = trimmed.get(..13)?;
+	if !prefix.eq_ignore_ascii_case("serein-p2p://") {
+		return None;
+	}
+	let rest = &trimmed[13..];
+	let (authority, query) = rest.split_once('?')?;
+	let authority = authority.trim_end_matches('/');
+	let (host, port_str) = if let Some(bracketed) = authority.strip_prefix('[') {
+		let (h, after) = bracketed.split_once(']')?;
+		let port_str = after.strip_prefix(':')?;
+		(h, port_str)
+	} else {
+		authority.rsplit_once(':')?
+	};
+	if host.is_empty() || host.chars().any(char::is_whitespace) {
+		return None;
+	}
+	let port: u16 = port_str.parse().ok().filter(|p| *p != 0)?;
+	let mut has_token = false;
+	let mut has_fp = false;
+	let mut width = None;
+	let mut height = None;
+	let mut fps = None;
+	for pair in query.split('&') {
+		let (k, v) = pair.split_once('=')?;
+		match k {
+			"t" => {
+				if !is_hex(v, 32) {
+					return None;
+				}
+				has_token = true;
+			}
+			"fp" => {
+				if !is_hex(v, 64) {
+					return None;
+				}
+				has_fp = true;
+			}
+			"w" => width = v.parse::<u32>().ok().filter(|n| *n > 0),
+			"h" => height = v.parse::<u32>().ok().filter(|n| *n > 0),
+			"fps" => fps = v.parse::<u32>().ok().filter(|n| *n > 0),
+			_ => {}
+		}
+	}
+	if !has_token || !has_fp {
+		return None;
+	}
+	let tailscale = host.parse::<Ipv4Addr>().is_ok_and(is_tailscale_ipv4);
+	Some(P2pLinkInfo {
+		raw: format!("serein-p2p://{authority}?{query}"),
+		host: host.to_owned(),
+		port,
+		tailscale,
+		width,
+		height,
+		fps,
+	})
+}
+
+/// Extracts all valid `serein-p2p://` invite links from message text (bounded to 4).
+pub fn extract_p2p_links(content: &str) -> Vec<P2pLinkInfo> {
+	let mut links = Vec::new();
+	for token in content.split_whitespace() {
+		if links.len() >= 4 {
+			break;
+		}
+		if let Some(info) = parse_p2p_link(token)
+			&& !links.iter().any(|existing: &P2pLinkInfo| existing.raw == info.raw)
+		{
+			links.push(info);
+		}
+	}
+	links
 }
 
 /// Output size for a choice, `None` when the source cannot use it. For a source sized
@@ -334,5 +476,16 @@ mod tests {
 		assert!(hd_144.valid());
 		assert!(hd_144.p2p_bit_rate() >= 30_000_000);
 		assert_eq!(P2pBitrate::Mbps60.bps(hd_144), 60_000_000);
+	}
+
+	#[test]
+	fn p2p_link_parser_validates_tailscale_and_quality() {
+		let raw = "Assistir agora: serein-p2p://100.64.12.9:45123?t=0123456789abcdef0123456789abcdef&fp=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&w=1920&h=1080&fps=120";
+		let links = extract_p2p_links(raw);
+		assert_eq!(links.len(), 1);
+		assert!(links[0].tailscale);
+		assert_eq!(links[0].port, 45123);
+		assert_eq!(links[0].quality_summary().as_deref(), Some("1080p 120fps"));
+		assert!(parse_p2p_link("serein-p2p://127.0.0.1:45123?t=short&fp=bad").is_none());
 	}
 }
