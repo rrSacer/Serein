@@ -158,3 +158,25 @@ downloads the pinned archive, checks its hash and rebuilds the file byte for byt
 enhanced by DeepFilterNet Plus `2dc5273d` on tract 0.22.5, recorded before that runtime was
 removed from this repository; the test beside it describes the input. The port locks no
 new package: it uses realfft 3.5.0 and bytemuck 1.25.2, both already linked.
+
+## Direct screen sharing
+
+The files below are copied byte for byte from the locked crates.io packages.
+
+| File | Registry package | SHA-256 |
+|---|---|---|
+| [`quinn-0.11.12-LICENSE-APACHE`](p2p/quinn-0.11.12-LICENSE-APACHE) | `quinn 0.11.12` | `c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4` |
+| [`quinn-0.11.12-LICENSE-MIT`](p2p/quinn-0.11.12-LICENSE-MIT) | `quinn 0.11.12` | `4b2d0aca6789fa39e03d6738e869ea0988cceba210ca34ebb59c15c463e93a04` |
+| [`quinn-proto-0.11.19-LICENSE-APACHE`](p2p/quinn-proto-0.11.19-LICENSE-APACHE) | `quinn-proto 0.11.19` | `c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4` |
+| [`quinn-proto-0.11.19-LICENSE-MIT`](p2p/quinn-proto-0.11.19-LICENSE-MIT) | `quinn-proto 0.11.19` | `4b2d0aca6789fa39e03d6738e869ea0988cceba210ca34ebb59c15c463e93a04` |
+| [`quinn-udp-0.5.16-LICENSE-APACHE`](p2p/quinn-udp-0.5.16-LICENSE-APACHE) | `quinn-udp 0.5.16` | `c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4` |
+| [`quinn-udp-0.5.16-LICENSE-MIT`](p2p/quinn-udp-0.5.16-LICENSE-MIT) | `quinn-udp 0.5.16` | `4b2d0aca6789fa39e03d6738e869ea0988cceba210ca34ebb59c15c463e93a04` |
+| [`rustls-0.23.46-LICENSE-APACHE`](p2p/rustls-0.23.46-LICENSE-APACHE) | `rustls 0.23.46` | `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2` |
+| [`rustls-0.23.46-LICENSE-ISC`](p2p/rustls-0.23.46-LICENSE-ISC) | `rustls 0.23.46` | `7cfafc877eccc46c0e346ccbaa5c51bb6b894d2b818e617d970211e232785ad4` |
+| [`rustls-0.23.46-LICENSE-MIT`](p2p/rustls-0.23.46-LICENSE-MIT) | `rustls 0.23.46` | `709e3175b4212f7b13aa93971c9f62ff8c69ec45ad8c6532a7e0c41d7a7d6f8c` |
+| [`rustls-webpki-0.103.17-LICENSE`](p2p/rustls-webpki-0.103.17-LICENSE) | `rustls-webpki 0.103.17` | `5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a` |
+| [`rcgen-0.14.10-LICENSE`](p2p/rcgen-0.14.10-LICENSE) | `rcgen 0.14.10` | `debe6fed7ac143217c7f533759c54b14f18cd01d5fe195c51d83c2ae2d136cb4` |
+| [`ring-0.17.14-LICENSE`](p2p/ring-0.17.14-LICENSE) | `ring 0.17.14` | `b3d734001a94efff3579978d953391aa7115f877657d25eb54037a43875d078a` |
+| [`ring-0.17.14-LICENSE-BoringSSL`](p2p/ring-0.17.14-LICENSE-BoringSSL) | `ring 0.17.14` | `005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d` |
+| [`ring-0.17.14-LICENSE-other-bits`](p2p/ring-0.17.14-LICENSE-other-bits) | `ring 0.17.14` | `f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f` |
+| [`subtle-2.6.1-LICENSE`](p2p/subtle-2.6.1-LICENSE) | `subtle 2.6.1` | `d1fc1bc0d155df60b2e7705b6b2ae02a05c96f948e1cec6e2fb86360b09f346b` |
