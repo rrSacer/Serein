@@ -1,5 +1,29 @@
 # DM and server voice
 
+## Direct screen sharing (P2P)
+
+Open **Screen P2P** in the desktop app. Neither participant needs to sign in to
+Discord or join a call. For remote sharing, connect both devices to Tailscale and
+allow the viewer to reach the host on UDP. Serein prefers the host's Tailscale
+IPv4 address when available and otherwise uses a local network address.
+
+1. On the host, choose a source, resolution, frame rate and bitrate. Select
+   **Start sharing** and complete the system picker when one appears.
+2. Select **Copy invitation**. Send the invitation privately to the viewer.
+3. On the viewer, open **Screen P2P**, paste the invitation and select **Watch**.
+   The viewer shows received FPS, throughput and network round trip time.
+
+Invitations are valid for one sharing session. **Stop sharing** disconnects
+viewers. The invitation includes an access token and the fingerprint of the
+host's temporary TLS certificate. Serein uses Quinn for QUIC, H.264 for screen
+video, and Opus for optional system audio. Each viewer uses a separate connection,
+so host upload usage grows with the number of viewers, up to eight.
+
+Start at 1080p and 60 fps with automatic bitrate. Higher settings are available
+depending on the capture source. The actual frame rate depends on the captured
+source, the encoder, the decoder and available bandwidth. A Tailscale connection
+over a relay can have higher latency than a direct route.
+
 The standard build implements native audio calls in existing one-to-one and group Discord DMs and guild voice channels. It uses the owner's existing account, Discord signaling/voice servers, Opus and DAVE version 1. There is no bot, project relay, separate account, recording service or webview call UI. **Live Discord interoperability and physical microphone/speaker behavior have not been tested; milestone 4 has not passed.**
 
 ```sh

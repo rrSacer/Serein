@@ -46,6 +46,7 @@ pub enum Resolution {
 
 pub const MAX_SHARE_WIDTH: u32 = 3840;
 pub const MAX_SHARE_HEIGHT: u32 = 2160;
+pub const MAX_P2P_BITRATE_BPS: u32 = 60_000_000;
 
 /// Smallest to largest, so the quality row reads 480p … 2160p, then Source.
 const PRESETS: [Resolution; 5] = [
@@ -93,6 +94,59 @@ pub fn offered_frame_rates(refresh_hz: u32) -> impl Iterator<Item = u32> {
 	[15, 30, 60, 90, 120]
 		.into_iter()
 		.filter(move |fps| *fps <= 60 || refresh_hz >= *fps)
+}
+
+/// High-FPS options for P2P gamer screen sharing. Sources that do not expose monitor
+/// refresh (`refresh_hz == 0`, such as Linux Wayland portals) still unlock 90–165 fps.
+pub fn offered_p2p_frame_rates(refresh_hz: u32) -> impl Iterator<Item = u32> {
+	[15, 30, 60, 90, 120, 144, 165]
+		.into_iter()
+		.filter(move |fps| refresh_hz == 0 || *fps <= 60 || refresh_hz >= *fps)
+}
+
+/// Bitrate ceiling offered for direct P2P streaming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum P2pBitrate {
+	#[default]
+	Auto,
+	Mbps8,
+	Mbps16,
+	Mbps25,
+	Mbps40,
+	Mbps60,
+}
+
+impl P2pBitrate {
+	pub const ALL: [Self; 6] = [
+		Self::Auto,
+		Self::Mbps8,
+		Self::Mbps16,
+		Self::Mbps25,
+		Self::Mbps40,
+		Self::Mbps60,
+	];
+
+	pub fn bps(self, settings: Settings) -> u32 {
+		match self {
+			Self::Auto => settings.p2p_bit_rate(),
+			Self::Mbps8 => 8_000_000,
+			Self::Mbps16 => 16_000_000,
+			Self::Mbps25 => 25_000_000,
+			Self::Mbps40 => 40_000_000,
+			Self::Mbps60 => 60_000_000,
+		}
+	}
+
+	pub fn label(self) -> &'static str {
+		match self {
+			Self::Auto => "Auto (Gamer)",
+			Self::Mbps8 => "8 Mbps",
+			Self::Mbps16 => "16 Mbps",
+			Self::Mbps25 => "25 Mbps",
+			Self::Mbps40 => "40 Mbps",
+			Self::Mbps60 => "60 Mbps",
+		}
+	}
 }
 
 /// Output size for a choice, `None` when the source cannot use it. For a source sized
@@ -177,7 +231,7 @@ impl Settings {
 			&& self.height <= MAX_SHARE_HEIGHT
 			&& self.width.is_multiple_of(2)
 			&& self.height.is_multiple_of(2)
-			&& matches!(self.fps, 15 | 30 | 60 | 90 | 120)
+			&& matches!(self.fps, 15 | 30 | 60 | 90 | 120 | 144 | 165)
 	}
 
 	pub fn bit_rate(self) -> u32 {
@@ -195,12 +249,37 @@ impl Settings {
 			u32::try_from(scaled.min(12_000_000)).unwrap_or(12_000_000)
 		};
 		let scale = match self.fps {
-			120 => 4,
+			120 | 144 | 165 => 4,
 			90 => 3,
 			60 => 2,
 			_ => 1,
 		};
 		base.saturating_mul(scale).min(16_000_000)
+	}
+
+	/// Target bitrate for gamer P2P streams (no Discord 16 Mbps cap).
+	pub fn p2p_bit_rate(self) -> u32 {
+		let pixels = u64::from(self.width) * u64::from(self.height);
+		let base: u64 = if pixels <= 854 * 480 {
+			4_000_000
+		} else if pixels <= 1280 * 720 {
+			8_000_000
+		} else if pixels <= 1920 * 1080 {
+			16_000_000
+		} else if pixels <= 2560 * 1440 {
+			25_000_000
+		} else {
+			36_000_000
+		};
+		let scaled = match self.fps {
+			144 | 165 => base.saturating_mul(2),
+			120 => base.saturating_mul(16) / 10,
+			90 => base.saturating_mul(14) / 10,
+			60 => base.saturating_mul(125) / 100,
+			_ => base,
+		};
+		u32::try_from(scaled.clamp(2_000_000, u64::from(MAX_P2P_BITRATE_BPS)))
+			.unwrap_or(MAX_P2P_BITRATE_BPS)
 	}
 }
 
@@ -231,5 +310,29 @@ impl Event {
 			}
 			_ => 0,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn p2p_frame_rates_and_bitrates_unlock_gamer_tiers() {
+		let portal_rates: Vec<_> = offered_p2p_frame_rates(0).collect();
+		assert_eq!(portal_rates, [15, 30, 60, 90, 120, 144, 165]);
+		let monitor_144: Vec<_> = offered_p2p_frame_rates(144).collect();
+		assert_eq!(monitor_144, [15, 30, 60, 90, 120, 144]);
+		let hd_144 = Settings {
+			source: SourceId::Portal,
+			width: 1920,
+			height: 1080,
+			fps: 144,
+			cursor: true,
+			audio: true,
+		};
+		assert!(hd_144.valid());
+		assert!(hd_144.p2p_bit_rate() >= 30_000_000);
+		assert_eq!(P2pBitrate::Mbps60.bps(hd_144), 60_000_000);
 	}
 }

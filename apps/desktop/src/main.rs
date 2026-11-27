@@ -40,6 +40,7 @@ mod notification_runtime;
 mod notification_sounds;
 #[cfg(feature = "demo")]
 mod onboarding_demo;
+mod p2p;
 mod pointer;
 #[cfg(feature = "demo")]
 mod polls_demo;
@@ -1068,6 +1069,7 @@ impl SessionEnd {
 /// Window placement, scale, monitor size and focus; any change re-reads the monitor's refresh rate.
 type MonitorKey = (Option<egui::Rect>, Option<f32>, Option<egui::Vec2>, bool);
 struct Desktop {
+	p2p: p2p::Panel,
 	proxy_auth: proxy_auth::Authentication,
 	api_proxy: tokio::sync::watch::Sender<Option<discord_api::proxy::ApiProxy>>,
 	extensions: extension_bridge::Bridge,
@@ -2642,6 +2644,7 @@ impl Desktop {
 			.map(|menu| (menu, ui::i18n::Language::System))
 		};
 		Ok(Self {
+			p2p: Default::default(),
 			proxy_auth: proxy_auth::Authentication::default(),
 			api_proxy: tokio::sync::watch::channel(None).0,
 			extensions: extension_bridge::Bridge::default(),
@@ -6421,6 +6424,9 @@ impl eframe::App for Desktop {
 		// exist (Hyprland); it counts as minimized, not as hiding to the tray.
 		let hidden_or_closing = (self.tray_window.hidden && !self.tray_window.tray_minimized)
 			|| ctx.input(|input| input.viewport().close_requested());
+		if hidden_or_closing {
+			self.p2p.stop();
+		}
 		let minimized = self.tray_window.tray_minimized
 			|| ctx.input(|input| input.viewport().minimized == Some(true));
 		let active = self.state.user.is_some()
@@ -6917,6 +6923,9 @@ impl eframe::App for Desktop {
 		}
 		// The window size the interface layout shown this frame asks for.
 		let mut interface_size = None;
+		if self.login.is_none() {
+			self.p2p.show(ui, self.runtime.handle());
+		}
 		if self.login.is_some() {
 			let p = ui::design::palette(ui);
 			egui::Panel::top("login-header")
