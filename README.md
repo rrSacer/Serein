@@ -41,6 +41,40 @@
 
 ---
 
+
+---
+
+## 🚀 Serein P2P — Transmissão de Tela Direta (QUIC / Tailscale / LAN)
+
+Esta versão customizada do Serein integra transmissão de tela **direta P2P via QUIC** de alta fidelidade e baixíssima latência, contornando limitações de rota/região da infraestrutura de mídia do Discord e dispensando restrições de permissão `STREAM` ou assinaturas Nitro.
+
+### ✨ Destaques do P2P
+- **Transporte QUIC Criptografado**: Streaming direto ponto a ponto com autenticação por token de sessão e pinning de certificado TLS efêmero via [Quinn](https://github.com/quinn-rs/quinn).
+- **Desempenho Gamer**: Suporte a resoluções nativas (720p, 1080p, 1440p, 4K ou fonte), taxas de quadros de **15 até 165 fps** e presets de bitrate de até **60 Mbps**.
+- **Interface 100% Nativa**: Integrado diretamente no diálogo padrão de compartilhamento (*"Compartilhe sua tela"*), no palco de voz nativo do Serein e no player de chamada.
+- **Convite Automático no Chat**: Envia o link `serein-p2p://` no canal da chamada quando você começa a transmitir e apaga a mensagem automaticamente ao parar.
+- **Compatível com Tailscale**: Conecte-se com seus amigos em redes virtuais como [Tailscale](https://tailscale.com/) ou pela rede local (LAN).
+
+### 📦 Instalação Rápida (Linux x86_64)
+
+Para instalar mantendo seu Serein oficial intacto e adicionando o atalho **Serein P2P**:
+
+```sh
+# Baixe a release mais recente e execute o instalador:
+curl -fsSL https://raw.githubusercontent.com/rrSacer/Serein/feat/direct-screen-p2p/install.sh | bash
+```
+
+Ou baixe o arquivo `serein-linux-x86_64-p2p.tar.gz` na página de [Releases](https://github.com/rrSacer/Serein/releases), descompacte e execute:
+```sh
+tar -xzf serein-linux-x86_64-p2p.tar.gz
+cd serein-linux-x86_64-p2p
+./install.sh
+```
+
+O script instala o executável em `~/.local/share/serein-p2p/serein` e cria o atalho no menu com o nome **Serein P2P**. O Serein original não é modificado.
+
+---
+
 ## Downloads & Installation
 
 Pre-compiled releases for macOS, Linux, and Windows are published on GitHub [Releases](https://github.com/ViceVerse-cz/Serein/releases).
