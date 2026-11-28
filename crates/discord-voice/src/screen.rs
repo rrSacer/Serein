@@ -382,7 +382,7 @@ fn encode_loop(
 		audio_epoch,
 		stop.clone(),
 	)?;
-	let mut encoding = None;
+	let mut encoding: Option<ScreenEncoder> = None;
 	let mut first_frame_deadline = Some(Instant::now() + Duration::from_secs(15));
 	#[cfg(not(target_os = "windows"))]
 	let mut next_frame = Instant::now();
