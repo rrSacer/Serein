@@ -11,10 +11,7 @@ const CARD_WIDTH: f32 = 432.0;
 pub enum WatchAction {
 	StartInCall(Id),
 	StopInCall,
-	StartDirect {
-		link: String,
-		label: String,
-	},
+	StartDirect { link: String, label: String },
 	StopDirect,
 }
 
@@ -258,16 +255,26 @@ fn render_card(
 
 				ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
 					let (btn_label, btn_kind, enabled) = if ended {
-						("p2p-stream-ended", crate::design::ButtonKind::Outline, false)
+						(
+							"p2p-stream-ended",
+							crate::design::ButtonKind::Outline,
+							false,
+						)
 					} else if watching {
 						("p2p-stop-watching", crate::design::ButtonKind::Danger, true)
 					} else if is_own {
-						("p2p-watch-stream", crate::design::ButtonKind::Outline, false)
+						(
+							"p2p-watch-stream",
+							crate::design::ButtonKind::Outline,
+							false,
+						)
 					} else {
 						("p2p-watch-stream", crate::design::ButtonKind::Primary, true)
 					};
 					let clicked = ui
-						.add_enabled_ui(enabled, |ui| crate::design::button(ui, btn_label, btn_kind))
+						.add_enabled_ui(enabled, |ui| {
+							crate::design::button(ui, btn_label, btn_kind)
+						})
 						.inner
 						.clicked();
 					if clicked {
@@ -306,9 +313,7 @@ fn render_card(
 							);
 							ui.add(
 								egui::Label::new(
-									egui::RichText::new(subtitle)
-										.size(12.0)
-										.color(colors.muted),
+									egui::RichText::new(subtitle).size(12.0).color(colors.muted),
 								)
 								.truncate()
 								.selectable(false),

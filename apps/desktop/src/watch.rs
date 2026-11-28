@@ -194,7 +194,11 @@ struct Live {
 
 /// Stores the streamer's pictures and asks for a frame when the next one is due. Only the
 /// picture changes then, so the request is for a paint-only frame.
-fn sink(frames: Arc<Mutex<Scheduled>>, expected_user: Option<u64>, wake: Wake) -> discord_voice::VideoSink {
+fn sink(
+	frames: Arc<Mutex<Scheduled>>,
+	expected_user: Option<u64>,
+	wake: Wake,
+) -> discord_voice::VideoSink {
 	Arc::new(move |frame: discord_voice::RemoteFrame| {
 		if let Some(streamer) = expected_user
 			&& frame.user != streamer
@@ -524,7 +528,8 @@ impl Watch {
 				""
 			};
 			return command.or_else(|| {
-				let context = discord_context.filter(|context| context.generation == state.generation)?;
+				let context =
+					discord_context.filter(|context| context.generation == state.generation)?;
 				Some(Command::Voice(voice::Command::StopWatching {
 					channel: context.channel,
 					request: context.request,
@@ -733,11 +738,8 @@ impl Watch {
 							));
 						}
 						Some(Notice::Failed(error)) => {
-							self.ended = Some((
-								ui::design::Level::Warning,
-								error,
-								Some(link.clone()),
-							));
+							self.ended =
+								Some((ui::design::Level::Warning, error, Some(link.clone())));
 						}
 						None => {}
 					}
@@ -862,7 +864,11 @@ impl Watch {
 		};
 		let frames = Arc::new(Mutex::new(Scheduled::default()));
 		let pictures = Wake::new(ctx, self.presenter.clone());
-		let sink = sink(frames.clone(), Some(pending.context.streamer.0), pictures.clone());
+		let sink = sink(
+			frames.clone(),
+			Some(pending.context.streamer.0),
+			pictures.clone(),
+		);
 		let (send, events) = watch::channel(None);
 		let wake = ctx.clone();
 		let identity = pending.identity;

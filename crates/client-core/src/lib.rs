@@ -2027,7 +2027,10 @@ impl State {
 				return;
 			}
 		}
-		let Some(link) = screen::extract_p2p_links(&message.content).into_iter().next() else {
+		let Some(link) = screen::extract_p2p_links(&message.content)
+			.into_iter()
+			.next()
+		else {
 			return;
 		};
 		self.p2p_streams
@@ -4038,7 +4041,8 @@ impl State {
 				self.forget_pending_replies(channel, &[id]);
 				// A card must never keep showing a reply that no longer exists.
 				self.thread_previews.forget(channel, &[id]);
-				self.p2p_streams.retain(|entry| !(entry.channel == channel && entry.message_id == id));
+				self.p2p_streams
+					.retain(|entry| !(entry.channel == channel && entry.message_id == id));
 				if let Some(channel) = self
 					.channels
 					.iter_mut()
@@ -4079,7 +4083,8 @@ impl State {
 			Event::DeleteBulk { channel, ids } => {
 				self.parked_replies.forget_targets(channel, &ids);
 				self.thread_previews.forget(channel, &ids);
-				self.p2p_streams.retain(|entry| !(entry.channel == channel && ids.contains(&entry.message_id)));
+				self.p2p_streams
+					.retain(|entry| !(entry.channel == channel && ids.contains(&entry.message_id)));
 				if ids.len() <= 100 {
 					for id in &ids {
 						self.read_state.activity.delete(channel, *id);

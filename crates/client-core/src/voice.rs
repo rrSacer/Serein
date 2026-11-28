@@ -1247,8 +1247,7 @@ impl ClientState {
 						.iter()
 						.any(|entry| entry.channel == channel && entry.user == user);
 					if !streaming
-						&& !has_p2p
-						&& let Some(call) = &mut self.voice.active
+						&& !has_p2p && let Some(call) = &mut self.voice.active
 						&& call.watching == Some(user)
 					{
 						call.watching = None;

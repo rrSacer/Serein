@@ -902,8 +902,7 @@ impl MessagingUi {
 					.stream_preview_open
 					.is_some_and(|(previous, last_frame)| {
 						previous == target && frame <= last_frame.saturating_add(1)
-					})
-			{
+					}) {
 				self.stream_preview_request = Some(target);
 			}
 			self.stream_preview_open = Some((target, frame));
@@ -1832,7 +1831,12 @@ impl MessagingUi {
 	}
 
 	/// Bottom-right actions over a fullscreen share: stream audio and Stop watching.
-	fn stream_overlay_controls(&mut self, ui: &mut egui::Ui, content: egui::Rect, direct_p2p: bool) {
+	fn stream_overlay_controls(
+		&mut self,
+		ui: &mut egui::Ui,
+		content: egui::Rect,
+		direct_p2p: bool,
+	) {
 		let height = 40.0;
 		let stop_label = "Stop watching";
 		let font = egui::FontId::new(13.0, design::medium_family(ui.ctx()));
@@ -4561,7 +4565,8 @@ impl MessagingUi {
 						};
 						if crate::icons::button(ui, toggle_icon, 28.0, "Toggle video").clicked() {
 							collapsed = !collapsed;
-							ui.ctx().data_mut(|data| data.insert_temp(collapse_id, collapsed));
+							ui.ctx()
+								.data_mut(|data| data.insert_temp(collapse_id, collapsed));
 						}
 						let fs = crate::icons::button(
 							ui,
@@ -4572,12 +4577,8 @@ impl MessagingUi {
 						if fs.clicked() {
 							let previous =
 								ui.input(|input| input.viewport().fullscreen.unwrap_or(false));
-							self.voice_fullscreen = Some((
-								StageFocus::P2pDirect,
-								ui.ctx().clone(),
-								previous,
-								fs.id,
-							));
+							self.voice_fullscreen =
+								Some((StageFocus::P2pDirect, ui.ctx().clone(), previous, fs.id));
 							self.voice_fullscreen_request = Some(true);
 						}
 						let vol = crate::icons::button(
