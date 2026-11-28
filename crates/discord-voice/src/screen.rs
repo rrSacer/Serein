@@ -748,7 +748,7 @@ pub(crate) fn i420_to_nv12(
 	Ok(())
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[allow(dead_code)]
 pub(super) fn encoder(settings: Settings, bitrate: u32) -> Result<Encoder, &'static str> {
 	encoder_with_max(settings, bitrate, settings.bit_rate())
 }
