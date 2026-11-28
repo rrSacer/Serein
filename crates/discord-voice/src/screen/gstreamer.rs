@@ -6,8 +6,9 @@ use ::gstreamer as gst;
 use gst::prelude::*;
 use gstreamer_app as app;
 use gstreamer_video::{self as video, VideoFrameExt};
+use std::borrow::Cow;
 use std::sync::{
-	Arc,
+	Arc, Mutex,
 	atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -32,22 +33,28 @@ pub(super) enum Mode {
 	VaLegacy,
 	Nvidia,
 	NvidiaCopy,
+	SoftwareX264,
+	SoftwareGl,
 	Software,
 }
+
 impl Mode {
-	pub(super) const ALL: [Self; 6] = [
+	pub(super) const ALL: [Self; 8] = [
 		Self::Va,
 		Self::VaCopy,
 		Self::VaLegacy,
 		Self::Nvidia,
 		Self::NvidiaCopy,
+		Self::SoftwareX264,
+		Self::SoftwareGl,
 		Self::Software,
 	];
+
 	/// Attempt order for the installed GPU. When `copy_first` is set (COSMIC, whose portal
-	/// stops a stream that fails to negotiate), the vendor's copy-based mode goes first:
+	/// stops a stream that fails to negotiate), copy/GL-capable modes go first:
 	/// importing the portal's DMA-BUF straight into vapostproc or EGL fails on portals that
-	/// only offer tiled/compressed formats, while a CPU copy into the same encoder works.
-	pub(super) fn order(gpu: Gpu, copy_first: bool) -> [Self; 6] {
+	/// only offer tiled/compressed formats, while a CPU copy or `glupload` works.
+	pub(super) fn order(gpu: Gpu, copy_first: bool) -> [Self; 8] {
 		if !copy_first {
 			return Self::ALL;
 		}
@@ -60,6 +67,8 @@ impl Mode {
 				Self::VaLegacy,
 				Self::Nvidia,
 				Self::NvidiaCopy,
+				Self::SoftwareX264,
+				Self::SoftwareGl,
 				Self::Software,
 			],
 			Gpu::Nvidia => [
@@ -68,6 +77,8 @@ impl Mode {
 				Self::VaCopy,
 				Self::Va,
 				Self::VaLegacy,
+				Self::SoftwareX264,
+				Self::SoftwareGl,
 				Self::Software,
 			],
 			Gpu::Other => [
@@ -76,10 +87,13 @@ impl Mode {
 				Self::Va,
 				Self::Nvidia,
 				Self::VaLegacy,
+				Self::SoftwareGl,
+				Self::SoftwareX264,
 				Self::Software,
 			],
 		}
 	}
+
 	pub(super) fn label(self) -> &'static str {
 		match self {
 			Self::Va => "H.264 · VA-API hardware encoding",
@@ -87,20 +101,204 @@ impl Mode {
 			Self::VaLegacy => "H.264 · VA-API hardware encoding · legacy plugin",
 			Self::Nvidia => "H.264 · NVENC hardware encoding",
 			Self::NvidiaCopy => "H.264 · NVENC hardware encoding · CPU scaling",
-			Self::Software => "H.264 · software encoding (higher CPU use)",
+			Self::SoftwareX264 => "H.264 · x264 software encoding",
+			Self::SoftwareGl => "H.264 · OpenH264 software encoding · GL DMA-BUF import",
+			Self::Software => "H.264 · OpenH264 software encoding (higher CPU use)",
 		}
 	}
+
+	/// True when this mode encodes frames inside GStreamer rather than bundled OpenH264.
+	pub(super) fn uses_gst_encoder(self) -> bool {
+		!matches!(self, Self::Software | Self::SoftwareGl)
+	}
+
+	/// True when this mode can toggle between Constrained Baseline and High profile.
+	pub(super) fn supports_high_profile(self) -> bool {
+		self.uses_gst_encoder()
+	}
+
 	/// Whether the scaler applies PipeWire's crop rectangle: vapostproc always does,
-	/// videoconvertscale only after GStreamer 1.29.2, and the GL mixer never does.
+	/// videoconvertscale only after GStreamer 1.29.2, and the GL mixer/scaler never does.
 	pub(super) fn applies_crop(self) -> bool {
 		match self {
 			Self::Va => true,
-			Self::Nvidia => false,
-			Self::VaCopy | Self::VaLegacy | Self::NvidiaCopy | Self::Software => {
-				gst::version() >= (1, 29, 3, 0)
-			}
+			Self::Nvidia | Self::SoftwareGl => false,
+			Self::VaCopy
+			| Self::VaLegacy
+			| Self::NvidiaCopy
+			| Self::SoftwareX264
+			| Self::Software => gst::version() >= (1, 29, 3, 0),
 		}
 	}
+
+	/// Pre-flight check of required GStreamer elements and hardware encoder state BEFORE
+	/// opening a PipeWire remote FD so unavailable modes cannot poison portal sessions.
+	pub(super) fn is_available(self) -> bool {
+		let has = |name: &str| gst::ElementFactory::find(name).is_some();
+		let has_scaler = has("videoconvertscale") || (has("videoconvert") && has("videoscale"));
+		let has_gl = has("glupload")
+			&& has("glcolorconvert")
+			&& has("glcolorscale")
+			&& has("gldownload")
+			&& has("videoconvert");
+		match self {
+			Self::Va => has("vapostproc") && has("h264parse") && probe_encoder("vah264enc"),
+			Self::VaCopy => has_scaler && has("h264parse") && probe_encoder("vah264enc"),
+			Self::VaLegacy => has_scaler && has("h264parse") && probe_encoder("vaapih264enc"),
+			Self::Nvidia => {
+				has_gl && has("glvideomixer") && has("h264parse") && probe_encoder("nvh264enc")
+			}
+			Self::NvidiaCopy => has_scaler && has("h264parse") && probe_encoder("nvh264enc"),
+			Self::SoftwareX264 => has_scaler && has("h264parse") && probe_encoder("x264enc"),
+			Self::SoftwareGl => has_gl,
+			Self::Software => has_scaler,
+		}
+	}
+}
+
+fn probe_encoder(name: &str) -> bool {
+	let Ok(el) = gst::ElementFactory::make(name).build() else {
+		return false;
+	};
+	let ok = el.set_state(gst::State::Ready).is_ok();
+	let _ = el.set_state(gst::State::Null);
+	ok
+}
+
+fn has_enum_nick(element: &gst::Element, prop_name: &str, nick: &str) -> bool {
+	let Some(pspec) = element.find_property(prop_name) else {
+		return false;
+	};
+	let Some(enum_class) = gst::glib::EnumClass::with_type(pspec.value_type()) else {
+		return false;
+	};
+	enum_class.to_value_by_nick(nick).is_some()
+}
+
+fn cpu_scaler_step() -> &'static str {
+	if let Ok(el) = gst::ElementFactory::make("videoconvertscale").build() {
+		if el.find_property("add-borders").is_some() {
+			"videoconvertscale add-borders=true"
+		} else {
+			"videoconvertscale"
+		}
+	} else if let Ok(el) = gst::ElementFactory::make("videoscale").build() {
+		if el.find_property("add-borders").is_some() {
+			"videoconvert ! videoscale add-borders=true"
+		} else {
+			"videoconvert ! videoscale"
+		}
+	} else {
+		"videoconvert ! videoscale"
+	}
+}
+
+fn build_gst_encoder_fragment(
+	mode: Mode,
+	bitrate_bps: u32,
+	fps: u32,
+	prefer_vbr: bool,
+	allow_high_profile: bool,
+) -> String {
+	let kbps = bitrate_bps / 1000;
+	let gop = fps * 2;
+	match mode {
+		Mode::Va | Mode::VaCopy => {
+			let rc = gst::ElementFactory::make("vah264enc")
+				.build()
+				.ok()
+				.filter(|el| prefer_vbr && has_enum_nick(el, "rate-control", "vbr"))
+				.map_or("cbr", |_| "vbr");
+			format!(
+				"vah264enc name=encoder rate-control={rc} bitrate={kbps} key-int-max={gop} b-frames=0"
+			)
+		}
+		Mode::VaLegacy => {
+			let rc = gst::ElementFactory::make("vaapih264enc")
+				.build()
+				.ok()
+				.filter(|el| prefer_vbr && has_enum_nick(el, "rate-control", "vbr"))
+				.map_or("cbr", |_| "vbr");
+			let profile_flags = if allow_high_profile {
+				"cabac=true dct8x8=true"
+			} else {
+				"cabac=false dct8x8=false"
+			};
+			format!(
+				"vaapih264enc name=encoder rate-control={rc} bitrate={kbps} keyframe-period={gop} max-bframes=0 {profile_flags}"
+			)
+		}
+		Mode::Nvidia | Mode::NvidiaCopy => {
+			let el = gst::ElementFactory::make("nvh264enc").build().ok();
+			let rc = el
+				.as_ref()
+				.filter(|el| prefer_vbr && has_enum_nick(el, "rc-mode", "vbr"))
+				.map_or("cbr", |_| "vbr");
+			let aq = if el
+				.as_ref()
+				.is_some_and(|el| prefer_vbr && el.find_property("spatial-aq").is_some())
+			{
+				" spatial-aq=true"
+			} else {
+				""
+			};
+			let max_br = if rc == "vbr"
+				&& el
+					.as_ref()
+					.is_some_and(|el| el.find_property("max-bitrate").is_some())
+			{
+				format!(" max-bitrate={kbps}")
+			} else {
+				String::new()
+			};
+			format!(
+				"nvh264enc name=encoder rc-mode={rc} bitrate={kbps}{max_br} gop-size={gop} bframes=0 rc-lookahead=0 zerolatency=true{aq}"
+			)
+		}
+		Mode::SoftwareX264 => {
+			let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 6));
+			format!(
+				"x264enc name=encoder tune=zerolatency speed-preset=superfast bitrate={kbps} key-int-max={gop} bframes=0 vbv-buf-capacity=300 threads={threads}"
+			)
+		}
+		Mode::Software | Mode::SoftwareGl => String::new(),
+	}
+}
+
+/// Checks required base GStreamer plugins before opening a desktop portal session.
+pub(super) fn check_base_plugins(direct_x11: bool) -> Result<(), &'static str> {
+	if direct_x11 {
+		if gst::ElementFactory::find("ximagesrc").is_none() {
+			return Err("X11 capture requires the GStreamer Good plugins (gst-plugins-good)");
+		}
+	} else if gst::ElementFactory::find("pipewiresrc").is_none() {
+		return Err(
+			"Install the GStreamer PipeWire plugin (gstreamer1.0-pipewire / gst-plugin-pipewire) to share your screen",
+		);
+	}
+	for required in [
+		"videorate",
+		"identity",
+		"capsfilter",
+		"tee",
+		"queue",
+		"appsink",
+	] {
+		if gst::ElementFactory::find(required).is_none() {
+			return Err(
+				"Install GStreamer base/core plugins (gstreamer1.0-plugins-base) to share your screen",
+			);
+		}
+	}
+	if gst::ElementFactory::find("videoconvertscale").is_none()
+		&& (gst::ElementFactory::find("videoconvert").is_none()
+			|| gst::ElementFactory::find("videoscale").is_none())
+	{
+		return Err(
+			"Install GStreamer base video conversion plugins (gstreamer1.0-plugins-base) to share your screen",
+		);
+	}
+	Ok(())
 }
 
 pub(super) struct Capture {
@@ -108,10 +306,12 @@ pub(super) struct Capture {
 	pub frames: app::AppSink,
 	pub preview: app::AppSink,
 	failed: Arc<AtomicBool>,
+	last_error: Arc<Mutex<Option<String>>>,
 	changed: Arc<tokio::sync::Notify>,
-	preview_gate: gst::Element,
+	preview_visible: Arc<AtomicBool>,
 	visible: Arc<AtomicU64>,
 }
+
 impl Drop for Capture {
 	fn drop(&mut self) {
 		// Downward transitions never complete asynchronously: this joins the streaming threads
@@ -119,6 +319,7 @@ impl Drop for Capture {
 		let _ = self.pipeline.set_state(gst::State::Null);
 	}
 }
+
 impl Capture {
 	/// `source` is either the approved PipeWire node or the offline example's test source.
 	#[allow(clippy::too_many_arguments)] // One pipeline and its existing media gates.
@@ -132,13 +333,15 @@ impl Capture {
 		ready: Arc<AtomicBool>,
 		keyframe: Arc<AtomicBool>,
 		has_capacity: impl Fn() -> bool + Send + Sync + 'static,
-	) -> Result<Self, &'static str> {
+	) -> Result<Self, Cow<'static, str>> {
 		Self::new_with_limits(
 			settings,
 			mode,
 			bitrate,
 			settings.bit_rate(),
 			MAX_ENCODED_BYTES,
+			false,
+			false,
 			source,
 			stop,
 			ready,
@@ -154,16 +357,19 @@ impl Capture {
 		bitrate: u32,
 		max_bitrate: u32,
 		max_encoded_bytes: usize,
+		prefer_vbr: bool,
+		allow_high_profile: bool,
 		source: gst::Element,
 		stop: Arc<AtomicBool>,
 		ready: Arc<AtomicBool>,
 		keyframe: Arc<AtomicBool>,
 		has_capacity: impl Fn() -> bool + Send + Sync + 'static,
-	) -> Result<Self, &'static str> {
+	) -> Result<Self, Cow<'static, str>> {
 		if !settings.valid() {
-			return Err(INVALID);
+			return Err(Cow::Borrowed(INVALID));
 		}
 		let bitrate = bitrate.clamp(250_000, max_bitrate.max(settings.bit_rate()));
+		let cpu_scale = cpu_scaler_step();
 		// A fixed rate keeps the GL mixer from fixating a rate from another tee branch.
 		let size = format!(
 			"width={},height={},pixel-aspect-ratio=1/1,framerate={}/1",
@@ -190,47 +396,51 @@ impl Capture {
 			// ponytail: CPU scaling avoids mixing VAMemory and legacy VASurface buffers;
 			// add legacy GPU postprocessing only if measured scaling cost warrants it.
 			Mode::VaCopy | Mode::VaLegacy => (
-				format!("videoconvertscale add-borders=true ! video/x-raw,format=NV12,{size}"),
+				format!("{cpu_scale} ! video/x-raw,format=NV12,{size}"),
+				format!("{cpu_scale} ! video/x-raw,format=BGRA,{preview_size}"),
+			),
+			Mode::SoftwareX264 => (
+				format!("{cpu_scale} ! video/x-raw,format=I420,{size}"),
+				format!("{cpu_scale} ! video/x-raw,format=BGRA,{preview_size}"),
+			),
+			Mode::SoftwareGl => (
 				format!(
-					"videoconvertscale add-borders=true ! video/x-raw,format=BGRA,{preview_size}"
+					"glupload ! glcolorconvert ! glcolorscale ! video/x-raw(memory:GLMemory),format=RGBA,{size} ! gldownload ! videoconvert ! video/x-raw,format=BGRA,{size}"
+				),
+				format!(
+					"glcolorscale ! video/x-raw(memory:GLMemory),format=RGBA,{preview_size} ! gldownload ! videoconvert ! video/x-raw,format=BGRA"
 				),
 			),
 			Mode::NvidiaCopy | Mode::Software => (
-				format!("videoconvertscale add-borders=true ! video/x-raw,format=BGRA,{size}"),
-				format!(
-					"videoconvertscale add-borders=true ! video/x-raw,format=BGRA,{preview_size}"
-				),
+				format!("{cpu_scale} ! video/x-raw,format=BGRA,{size}"),
+				format!("{cpu_scale} ! video/x-raw,format=BGRA,{preview_size}"),
 			),
 		};
-		let encoder = match mode {
-			Mode::Va | Mode::VaCopy => format!(
-				"vah264enc name=encoder rate-control=cbr bitrate={} key-int-max={} b-frames=0",
-				bitrate / 1000,
-				settings.fps * 2
-			),
-			Mode::VaLegacy => format!(
-				"vaapih264enc name=encoder rate-control=cbr bitrate={} keyframe-period={} max-bframes=0 cabac=false dct8x8=false",
-				bitrate / 1000,
-				settings.fps * 2
-			),
-			Mode::Nvidia | Mode::NvidiaCopy => format!(
-				"nvh264enc name=encoder rc-mode=cbr bitrate={} gop-size={} bframes=0 rc-lookahead=0 zerolatency=true",
-				bitrate / 1000,
-				settings.fps * 2
-			),
-			Mode::Software => String::new(),
-		};
-		let encode = if mode == Mode::Software {
+		let uses_gst_encoder = mode.uses_gst_encoder();
+		let encode = if !uses_gst_encoder {
 			String::new()
 		} else {
+			let encoder = build_gst_encoder_fragment(
+				mode,
+				bitrate,
+				settings.fps,
+				prefer_vbr,
+				allow_high_profile,
+			);
+			let profile = if allow_high_profile {
+				"high"
+			} else {
+				"constrained-baseline"
+			};
 			format!(
-				"{encoder} ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline !"
+				"{encoder} ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au,profile={profile} !"
 			)
 		};
 		// Raw queues discard stale pictures. The encoded sink blocks upstream instead of
 		// discarding reference pictures; pressure then reaches the raw queue.
 		// Some portals (xdph 1.4.1) send no pixel aspect; listing 1/1 first stops pipewiresrc
 		// fixating 1/2147483647 while still accepting match_crop_aspect's ratio.
+		// `identity name=preview-gate` replaces `valve` (which requires gst-plugins-bad).
 		let description = format!(
 			"capsfilter caps=\"video/x-raw(ANY),width=[1,7680],height=[1,4320],pixel-aspect-ratio={{1/1,[1/2147483647,2147483647/1]}}\" ! \
 			queue max-size-buffers=1 max-size-bytes={MAX_SOURCE_BYTES} max-size-time=0 leaky=downstream ! \
@@ -238,55 +448,84 @@ impl Capture {
 			split. ! queue max-size-buffers=1 max-size-bytes={MAX_RAW_BYTES} max-size-time=0 leaky=downstream ! \
 			identity name=gate ! {encode} appsink name=frames sync=false async=false max-buffers=1 enable-last-sample=false wait-on-eos=false \
 			split. ! queue max-size-buffers=1 max-size-bytes={MAX_RAW_BYTES} max-size-time=0 leaky=downstream ! \
-			valve name=preview-gate drop-mode=forward-sticky-events ! videorate drop-only=true ! video/x-raw(ANY),framerate={}/1 ! {preview_scale} ! \
+			identity name=preview-gate ! videorate drop-only=true ! video/x-raw(ANY),framerate={}/1 ! {preview_scale} ! \
 			appsink name=preview sync=false async=false max-buffers=1 drop=true enable-last-sample=false wait-on-eos=false",
 			settings.fps, settings.fps
 		);
-		let bin = gst::parse::bin_from_description(&description, true).map_err(|_| UNAVAILABLE)?;
+		let bin = gst::parse::bin_from_description(&description, true)
+			.map_err(|err| Cow::Owned(format!("{}: {err}", mode.label())))?;
 		let pipeline = gst::Pipeline::new();
 		// pipewiresrc's clock never advances on some portals (xdg-desktop-portal-hyprland),
 		// so GstBaseSrc would hold every live picture after the first.
 		pipeline.use_clock(Some(&gst::SystemClock::obtain()));
 		let failed = Arc::new(AtomicBool::new(false));
+		let last_error = Arc::new(Mutex::new(None::<String>));
 		let changed = Arc::new(tokio::sync::Notify::new());
-		let bus = pipeline.bus().ok_or(UNAVAILABLE)?;
+		let bus = pipeline.bus().ok_or(Cow::Borrowed(UNAVAILABLE))?;
 		bus.set_sync_handler({
 			let failed = failed.clone();
+			let last_error = last_error.clone();
 			let changed = changed.clone();
 			move |_, message| {
-				if matches!(
-					message.view(),
-					gst::MessageView::Error(_) | gst::MessageView::Eos(_)
-				) {
-					failed.store(true, Ordering::Release);
-					changed.notify_one();
+				match message.view() {
+					gst::MessageView::Error(err) => {
+						if let Ok(mut slot) = last_error.lock()
+							&& slot.is_none()
+						{
+							*slot = Some(err.error().to_string());
+						}
+						failed.store(true, Ordering::Release);
+						changed.notify_one();
+					}
+					gst::MessageView::Eos(_) => {
+						failed.store(true, Ordering::Release);
+						changed.notify_one();
+					}
+					_ => {}
 				}
-				// Do not retain bus messages or expose native error text/source names.
 				gst::BusSyncReply::Drop
 			}
 		});
 		pipeline
 			.add_many([&source, bin.upcast_ref()])
-			.map_err(|_| UNAVAILABLE)?;
-		source.link(&bin).map_err(|_| UNAVAILABLE)?;
+			.map_err(|_| Cow::Borrowed(UNAVAILABLE))?;
+		source.link(&bin).map_err(|_| Cow::Borrowed(UNAVAILABLE))?;
 		let visible = Arc::new(AtomicU64::new(0));
 		if mode.applies_crop() {
 			match_crop_aspect(
-				&source.static_pad("src").ok_or(UNAVAILABLE)?,
+				&source.static_pad("src").ok_or(Cow::Borrowed(UNAVAILABLE))?,
 				visible.clone(),
 			);
 		}
 		let frames = sink(&bin, "frames")?;
 		let preview = sink(&bin, "preview")?;
-		let preview_gate = bin.by_name("preview-gate").ok_or(UNAVAILABLE)?;
+		let preview_gate = bin
+			.by_name("preview-gate")
+			.ok_or(Cow::Borrowed(UNAVAILABLE))?;
+		let preview_visible = Arc::new(AtomicBool::new(true));
+		{
+			let preview_visible = preview_visible.clone();
+			preview_gate
+				.static_pad("src")
+				.ok_or(Cow::Borrowed(UNAVAILABLE))?
+				.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+					if preview_visible.load(Ordering::Acquire) {
+						gst::PadProbeReturn::Ok
+					} else {
+						gst::PadProbeReturn::Drop
+					}
+				});
+		}
 		bound(
-			&source.static_pad("src").ok_or(UNAVAILABLE)?,
+			&source.static_pad("src").ok_or(Cow::Borrowed(UNAVAILABLE))?,
 			MAX_SOURCE_BYTES,
 			failed.clone(),
 		);
 		bound(
-			&frames.static_pad("sink").ok_or(UNAVAILABLE)?,
-			if mode == Mode::Software {
+			&frames
+				.static_pad("sink")
+				.ok_or(Cow::Borrowed(UNAVAILABLE))?,
+			if !uses_gst_encoder {
 				MAX_RAW_BYTES
 			} else {
 				max_encoded_bytes
@@ -294,7 +533,9 @@ impl Capture {
 			failed.clone(),
 		);
 		bound(
-			&preview.static_pad("sink").ok_or(UNAVAILABLE)?,
+			&preview
+				.static_pad("sink")
+				.ok_or(Cow::Borrowed(UNAVAILABLE))?,
 			MAX_RAW_BYTES,
 			failed.clone(),
 		);
@@ -311,7 +552,7 @@ impl Capture {
 		}
 		bin.by_name("gate")
 			.and_then(|gate| gate.static_pad("src"))
-			.ok_or(UNAVAILABLE)?
+			.ok_or(Cow::Borrowed(UNAVAILABLE))?
 			.add_probe(gst::PadProbeType::BUFFER, move |pad, _| {
 				if stop.load(Ordering::Acquire) || !ready.load(Ordering::Acquire) {
 					keyframe.store(true, Ordering::Release);
@@ -320,7 +561,7 @@ impl Capture {
 				if !has_capacity() {
 					return gst::PadProbeReturn::Drop;
 				}
-				if mode != Mode::Software
+				if uses_gst_encoder
 					&& keyframe.swap(false, Ordering::AcqRel)
 					&& !pad.push_event(
 						video::DownstreamForceKeyUnitEvent::builder()
@@ -336,16 +577,18 @@ impl Capture {
 			frames,
 			preview,
 			failed,
+			last_error,
 			changed,
-			preview_gate,
+			preview_visible,
 			visible,
 		};
 		capture
 			.pipeline
 			.set_state(gst::State::Playing)
-			.map_err(|_| UNAVAILABLE)?;
+			.map_err(|_| Cow::Borrowed(UNAVAILABLE))?;
 		Ok(capture)
 	}
+
 	pub(super) fn set_bitrate(&self, bitrate: u32) -> bool {
 		let Some(encoder) = self.pipeline.by_name("encoder") else {
 			return false;
@@ -361,8 +604,9 @@ impl Capture {
 	}
 
 	pub(super) fn set_preview_visible(&self, visible: bool) {
-		self.preview_gate.set_property("drop", !visible);
+		self.preview_visible.store(visible, Ordering::Release);
 	}
+
 	pub(super) async fn changed(&self) {
 		let _ = tokio::time::timeout(
 			std::time::Duration::from_millis(100),
@@ -370,9 +614,15 @@ impl Capture {
 		)
 		.await;
 	}
+
 	pub(super) fn failed(&self) -> bool {
 		self.failed.load(Ordering::Acquire)
 	}
+
+	pub(super) fn error_detail(&self) -> Option<String> {
+		self.last_error.lock().ok().and_then(|guard| guard.clone())
+	}
+
 	/// The shown size of this pipeline's latest source buffer, in modes that apply crops.
 	/// `None` until a buffer arrives, so raw caps never resize a cropped window cast.
 	pub(super) fn visible_size(&self) -> Option<(u32, u32)> {
@@ -384,11 +634,13 @@ impl Capture {
 		(width > 0 && height > 0).then_some((width, height))
 	}
 }
-fn sink(bin: &gst::Bin, name: &str) -> Result<app::AppSink, &'static str> {
+
+fn sink(bin: &gst::Bin, name: &str) -> Result<app::AppSink, Cow<'static, str>> {
 	bin.by_name(name)
 		.and_then(|element| element.downcast().ok())
-		.ok_or(UNAVAILABLE)
+		.ok_or(Cow::Borrowed(UNAVAILABLE))
 }
+
 /// Window casts may keep the stream size and mark the window with a crop rectangle. Scalers
 /// that apply it still place borders by the caps' aspect ratio, stretching the window, so
 /// declare the (square) source pixels in a shape that gives the caps the crop's aspect ratio.
@@ -446,9 +698,11 @@ fn match_crop_aspect(pad: &gst::Pad, visible: Arc<AtomicU64>) {
 		gst::PadProbeReturn::Ok
 	});
 }
+
 fn pack_size(width: u32, height: u32) -> u64 {
 	(u64::from(width) << 32) | u64::from(height)
 }
+
 fn bound(pad: &gst::Pad, bytes: usize, failed: Arc<AtomicBool>) {
 	pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
 		if info.buffer().is_none_or(|buffer| buffer.size() > bytes) {
@@ -631,6 +885,30 @@ mod tests {
 				}
 			}
 		}
+	}
+
+	#[test]
+	fn software_mode_builds_without_bad_plugins_and_supports_preview_gate() {
+		gst::init().unwrap();
+		assert!(Mode::Software.is_available());
+		let source = gst::ElementFactory::make("videotestsrc")
+			.property("is-live", true)
+			.build()
+			.unwrap();
+		let cap = capture(source, true);
+		cap.set_preview_visible(false);
+		cap.set_preview_visible(true);
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while Instant::now() < deadline {
+			if cap
+				.frames
+				.try_pull_sample(gst::ClockTime::from_mseconds(50))
+				.is_some()
+			{
+				return;
+			}
+		}
+		panic!("software capture produced no frames");
 	}
 
 	/// The logged Hyprland format had no pixel aspect, and pipewiresrc's fixation of the

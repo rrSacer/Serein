@@ -97,6 +97,8 @@ fn nvenc_exit() {
 				settings.bit_rate(),
 				settings.bit_rate(),
 				MAX_ENCODED_BYTES,
+				false,
+				false,
 				source,
 				worker_stop.clone(),
 				ready,
@@ -184,7 +186,21 @@ fn main() {
 			});
 			linux::timestamp_niri_frames(&source).unwrap();
 		}
-		let pipeline = Capture::new_with_limits(settings, mode, settings.bit_rate(), settings.bit_rate(), MAX_ENCODED_BYTES, source, stop.clone(), ready.clone(), keyframe.clone(), || true).unwrap();
+		let pipeline = Capture::new_with_limits(
+			settings,
+			mode,
+			settings.bit_rate(),
+			settings.bit_rate(),
+			MAX_ENCODED_BYTES,
+			false,
+			false,
+			source,
+			stop.clone(),
+			ready.clone(),
+			keyframe.clone(),
+			|| true,
+		)
+		.unwrap();
 		let deadline = Instant::now() + Duration::from_secs(5);
 		let mut previews = 0;
 		let mut last_preview_pts = None;

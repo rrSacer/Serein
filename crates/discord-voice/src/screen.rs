@@ -33,7 +33,7 @@ use openh264::{
 use std::borrow::Cow;
 use std::sync::{
 	Arc, Mutex,
-	atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+	atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
 	mpsc,
 };
 
@@ -76,6 +76,8 @@ pub struct Video {
 	pub keyframe: Arc<AtomicBool>,
 	/// Transport feedback target in bits per second, bounded by the selected quality.
 	pub bitrate: Arc<AtomicU32>,
+	/// Negotiated viewer capability bitmask (`CAP_*`) for P2P profile selection.
+	pub(crate) peer_caps: Arc<AtomicU8>,
 	/// Interleaved 48 kHz stereo system audio, present only when the share requested it.
 	pub audio: Option<tokio::sync::mpsc::Receiver<AudioChunk>>,
 	pub audio_epoch: Arc<AtomicU64>,
@@ -143,7 +145,7 @@ impl Worker {
 				.ok()
 				.as_deref(),
 		);
-		Self::start_with_limits(settings, max_bitrate, MAX_ENCODED_BYTES, wake)
+		Self::start_with_limits(settings, max_bitrate, MAX_ENCODED_BYTES, false, wake)
 	}
 
 	pub fn start_p2p(
@@ -152,13 +154,14 @@ impl Worker {
 		wake: impl Fn() + Send + 'static,
 	) -> Result<(Self, Video), &'static str> {
 		let capped = max_bitrate.clamp(250_000, client_core::screen::MAX_P2P_BITRATE_BPS);
-		Self::start_with_limits(settings, capped, P2P_MAX_ENCODED_BYTES, wake)
+		Self::start_with_limits(settings, capped, P2P_MAX_ENCODED_BYTES, true, wake)
 	}
 
 	fn start_with_limits(
 		settings: Settings,
 		max_bitrate: u32,
 		max_encoded_bytes: usize,
+		is_p2p: bool,
 		wake: impl Fn() + Send + 'static,
 	) -> Result<(Self, Video), &'static str> {
 		if !settings.valid() || !supported() {
@@ -171,6 +174,8 @@ impl Worker {
 		let keyframe = Arc::new(AtomicBool::new(true));
 		let bitrate = Arc::new(AtomicU32::new(max_bitrate));
 		let worker_bitrate = bitrate.clone();
+		let peer_caps = Arc::new(AtomicU8::new(crate::video_codec::CAP_H264_BASELINE));
+		let worker_peer_caps = peer_caps.clone();
 		let preview = Arc::new(Mutex::new(None));
 		let worker_preview = preview.clone();
 		#[cfg(target_os = "linux")]
@@ -206,10 +211,12 @@ impl Worker {
 					settings,
 					max_bitrate,
 					max_encoded_bytes,
+					is_p2p,
 					worker_stop,
 					worker_ready,
 					worker_keyframe,
 					worker_bitrate,
+					worker_peer_caps,
 					send,
 					audio_send,
 					worker_audio_epoch,
@@ -218,17 +225,18 @@ impl Worker {
 					worker_preview_visible,
 					worker_captured,
 					&wake,
-				)
-				.map_err(Cow::Borrowed);
+				);
 				#[cfg(not(target_os = "linux"))]
 				let result = encode_loop(
 					settings,
 					max_bitrate,
 					max_encoded_bytes,
+					is_p2p,
 					worker_stop,
 					worker_ready,
 					worker_keyframe,
 					worker_bitrate,
+					worker_peer_caps,
 					send,
 					audio_send,
 					worker_audio_epoch,
@@ -268,6 +276,7 @@ impl Worker {
 				ready,
 				keyframe,
 				bitrate,
+				peer_caps,
 				audio,
 				audio_epoch,
 			},
@@ -329,10 +338,12 @@ fn encode_loop(
 	settings: Settings,
 	max_bitrate: u32,
 	max_encoded_bytes: usize,
+	is_p2p: bool,
 	stop: Arc<AtomicBool>,
 	ready: Arc<AtomicBool>,
 	keyframe: Arc<AtomicBool>,
 	bitrate: Arc<AtomicU32>,
+	peer_caps: Arc<AtomicU8>,
 	send: tokio::sync::mpsc::Sender<EncodedFrame>,
 	audio: Option<tokio::sync::mpsc::Sender<AudioChunk>>,
 	audio_epoch: Arc<AtomicU64>,
@@ -471,12 +482,27 @@ fn encode_loop(
 		let target = bitrate
 			.load(Ordering::Acquire)
 			.clamp(250_000, effective_max);
+		let want_profile = if !is_p2p
+			|| (peer_caps.load(Ordering::Acquire) & crate::video_codec::CAP_H264_HIGH) != 0
+		{
+			crate::video_encode::Profile::Main
+		} else {
+			crate::video_encode::Profile::Baseline
+		};
+		if encoding
+			.as_ref()
+			.is_some_and(|enc| enc.profile != want_profile)
+		{
+			encoding = None;
+			keyframe.store(true, Ordering::Release);
+		}
 		if encoding.is_none() {
 			encoding = Some(ScreenEncoder::new(
 				settings,
 				target,
 				effective_max,
 				max_encoded_bytes,
+				want_profile,
 			)?);
 		}
 		if encoding
@@ -560,6 +586,7 @@ struct ScreenEncoder {
 	bitrate: u32,
 	max_bitrate: u32,
 	max_encoded_bytes: usize,
+	profile: crate::video_encode::Profile,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -569,6 +596,7 @@ impl ScreenEncoder {
 		bitrate: u32,
 		max_bitrate: u32,
 		max_encoded_bytes: usize,
+		profile: crate::video_encode::Profile,
 	) -> Result<Self, &'static str> {
 		let config = crate::video_encode::Config {
 			width: settings.width,
@@ -576,7 +604,7 @@ impl ScreenEncoder {
 			fps: settings.fps,
 			bit_rate: bitrate,
 			max_bytes: max_encoded_bytes,
-			profile: crate::video_encode::Profile::Main,
+			profile,
 		};
 		#[cfg(target_os = "macos")]
 		let hardware = crate::video_encode::hardware::Encoder::new(
@@ -600,6 +628,7 @@ impl ScreenEncoder {
 			bitrate,
 			max_bitrate,
 			max_encoded_bytes,
+			profile,
 		})
 	}
 
@@ -632,6 +661,7 @@ impl ScreenEncoder {
 				bitrate,
 				self.max_bitrate,
 				self.max_encoded_bytes,
+				self.profile,
 			)?;
 		}
 		Ok(true)

@@ -46,6 +46,7 @@ pub struct H264Decoder {
 	active: Option<Active>,
 	output: Arc<Mutex<Output>>,
 	pictures: i64,
+	max_access_unit: usize,
 }
 
 impl H264Decoder {
@@ -53,10 +54,17 @@ impl H264Decoder {
 		Self::new_timed(Box::new(move |frame, _| sink(frame)))
 	}
 	pub fn new_timed(sink: super::TimedLiveSink) -> Result<Self, &'static str> {
+		Self::new_timed_with_limit(sink, MAX_ACCESS_UNIT)
+	}
+	pub fn new_timed_with_limit(
+		sink: super::TimedLiveSink,
+		max_access_unit: usize,
+	) -> Result<Self, &'static str> {
 		Ok(Self {
 			active: None,
 			output: Arc::new(Mutex::new(Output { sink, error: None })),
 			pictures: 0,
+			max_access_unit: max_access_unit.max(MAX_ACCESS_UNIT),
 		})
 	}
 
@@ -69,7 +77,7 @@ impl H264Decoder {
 		if tag > i64::MAX as u64 / 1_000_000 {
 			return Err(INVALID);
 		}
-		if access_unit.len() > MAX_ACCESS_UNIT {
+		if access_unit.len() > self.max_access_unit {
 			return Err(INVALID);
 		}
 		let mut sps = None;

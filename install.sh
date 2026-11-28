@@ -119,6 +119,36 @@ chmod 0644 "$APP_ENTRY_DIR/serein-p2p.desktop"
 # Atualiza cache de aplicativos se a ferramenta existir
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APP_ENTRY_DIR" >/dev/null 2>&1 || true
 
+# Verificação não-bloqueante dos plugins GStreamer necessários para captura no Linux
+check_runtime_gst() {
+  if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
+    printf '\nAviso: gst-inspect-1.0 não encontrado; certifique-se de ter PipeWire + GStreamer base/good instalados para transmitir tela.\n'
+    return 0
+  fi
+
+  local missing=()
+  for plugin in pipewiresrc videorate identity capsfilter tee queue appsink; do
+    if ! gst-inspect-1.0 "$plugin" >/dev/null 2>&1; then
+      missing+=("$plugin")
+    fi
+  done
+
+  if ! gst-inspect-1.0 videoconvertscale >/dev/null 2>&1; then
+    if ! gst-inspect-1.0 videoconvert >/dev/null 2>&1 || ! gst-inspect-1.0 videoscale >/dev/null 2>&1; then
+      missing+=("videoconvert/videoscale")
+    fi
+  fi
+
+  if (( ${#missing[@]} > 0 )); then
+    printf '\n⚠️  Plugins GStreamer essenciais ausentes para captura de tela: %s\n' "${missing[*]}"
+    printf '   O modo software embutido (OpenH264) NÃO precisa de codec de hardware nem gst-plugins-bad/libav,\n'
+    printf '   mas precisa da captura base do PipeWire + GStreamer:\n'
+    printf '   • Ubuntu/Debian: sudo apt install gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-plugins-good\n'
+    printf '   • Fedora:        sudo dnf install pipewire-gstreamer gstreamer1-plugins-base gstreamer1-plugins-good\n'
+    printf '   • Arch Linux:    sudo pacman -S gst-plugin-pipewire gst-plugins-base gst-plugins-good\n'
+  fi
+}
+
 printf '\n======================================================\n'
 printf '  Serein P2P instalado com sucesso!\n'
 printf '======================================================\n'
@@ -127,3 +157,4 @@ printf '  (O seu atalho do Serein original foi totalmente preservado)\n'
 printf '• Executável instalado em: %s\n' "$APP_DIR/serein"
 printf '• Comando via terminal: %s/serein-p2p\n\n' "$BIN_DIR"
 printf 'Você já pode abrir o "Serein P2P" pelo menu de aplicativos!\n'
+check_runtime_gst

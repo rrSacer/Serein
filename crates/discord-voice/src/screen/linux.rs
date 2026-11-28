@@ -6,6 +6,7 @@ use super::{
 	portal_linux::Portal,
 	preview_frame,
 };
+use crate::video_codec::CAP_H264_HIGH;
 use ::gstreamer as gst;
 /// A capture source that has nothing new to send still emits a keepalive picture once a
 /// second, so a frozen share is not a gap between pictures but a run of seconds carrying
@@ -103,10 +104,11 @@ fn cosmic_session() -> bool {
 use gst::prelude::*;
 use openh264::formats::YUVBuffer;
 use std::{
+	borrow::Cow,
 	os::fd::AsRawFd,
 	sync::{
 		Arc, Mutex,
-		atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
 	},
 	time::{Duration, Instant},
 };
@@ -126,10 +128,12 @@ pub(super) fn run(
 	settings: Settings,
 	max_bitrate: u32,
 	max_encoded_bytes: usize,
+	is_p2p: bool,
 	stop: Arc<AtomicBool>,
 	ready: Arc<AtomicBool>,
 	keyframe: Arc<AtomicBool>,
 	bitrate: Arc<AtomicU32>,
+	peer_caps: Arc<AtomicU8>,
 	send: tokio::sync::mpsc::Sender<EncodedFrame>,
 	audio_send: Option<tokio::sync::mpsc::Sender<AudioChunk>>,
 	audio_epoch: Arc<AtomicU64>,
@@ -138,22 +142,29 @@ pub(super) fn run(
 	preview_visible: Arc<AtomicBool>,
 	captured: Arc<AtomicBool>,
 	wake: &impl Fn(),
-) -> Result<(), &'static str> {
+) -> Result<(), Cow<'static, str>> {
 	let direct = settings.source == SourceId::X11Desktop && x11_session();
 	if (!direct && settings.source != SourceId::Portal) || !settings.valid() {
-		return Err("Choose a source with the Linux screen picker");
+		return Err(Cow::Borrowed(
+			"Choose a source with the Linux screen picker",
+		));
 	}
-	gst::init().map_err(|_| "GStreamer is unavailable")?;
+	gst::init().map_err(|_| Cow::Borrowed("GStreamer is unavailable"))?;
+	capture::check_base_plugins(direct).map_err(Cow::Borrowed)?;
 	// This runtime belongs to the existing media worker, never the render thread.
 	let runtime = tokio::runtime::Builder::new_current_thread()
 		.enable_all()
 		.build()
-		.map_err(|_| "Could not start the screen picker")?;
+		.map_err(|_| Cow::Borrowed("Could not start the screen picker"))?;
 	runtime.block_on(async {
 		let mut portal = if direct {
 			None
 		} else {
-			Some(Portal::open(settings.cursor, &stop).await?)
+			Some(
+				Portal::open(settings.cursor, &stop)
+					.await
+					.map_err(Cow::Borrowed)?,
+			)
 		};
 		// The quality row chose a bound before the pick; size the picture to the picked
 		// stream, never upscaling it. The portal's optional `size` is in compositor
@@ -170,7 +181,7 @@ pub(super) fn run(
 		let mut audio = None;
 		// Sticky: the label must keep saying so after the worker is gone.
 		let mut audio_stopped = false;
-		let result = async {
+		let result: Result<(), Cow<'static, str>> = async {
 			if stop.load(Ordering::Acquire) || send.is_closed() {
 				return Ok(());
 			}
@@ -178,24 +189,35 @@ pub(super) fn run(
 				.map(|send| {
 					audio_linux::Worker::start(send, stop.clone(), ready.clone(), audio_epoch)
 				})
-				.transpose()?;
+				.transpose()
+				.map_err(Cow::Borrowed)?;
 			let mut mode_index = 0;
 			let modes = Mode::order(gpu(), cosmic_session());
 			let mut noted_capture = false;
+			let mut last_error: Option<String> = None;
 			while let Some(&mode) = modes.get(mode_index) {
 				mode_index += 1;
 				if stop.load(Ordering::Acquire) || send.is_closed() {
 					return Ok(());
 				}
 				if portal.as_mut().is_some_and(Portal::is_closed) {
-					return Err("The desktop stopped screen sharing");
+					return Err(Cow::Borrowed("The desktop stopped screen sharing"));
+				}
+				if !mode.is_available() {
+					note("mode_unavailable", mode.label());
+					continue;
 				}
 				let mut remote = None;
 				let source = if let Some(portal) = &mut portal {
-					let source = gst::ElementFactory::make("pipewiresrc").build().map_err(
-						|_| "Install the GStreamer PipeWire plugin to share your screen",
-					)?;
-					remote = Some(portal.open_remote(&stop).await?);
+					let source =
+						gst::ElementFactory::make("pipewiresrc")
+							.build()
+							.map_err(|_| {
+								Cow::Borrowed(
+									"Install the GStreamer PipeWire plugin to share your screen",
+								)
+							})?;
+					remote = Some(portal.open_remote(&stop).await.map_err(Cow::Borrowed)?);
 					source.set_property(
 						"fd",
 						remote.as_ref().expect("portal remote opened").as_raw_fd(),
@@ -212,7 +234,7 @@ pub(super) fn run(
 					if std::env::var("XDG_CURRENT_DESKTOP")
 						.is_ok_and(|desktop| niri_desktop(&desktop))
 					{
-						timestamp_niri_frames(&source)?;
+						timestamp_niri_frames(&source).map_err(Cow::Borrowed)?;
 					}
 					// Damage-driven desktops still need a fresh IDR when a viewer joins an idle screen.
 					source.set_property("keepalive-time", 1000i32);
@@ -220,7 +242,7 @@ pub(super) fn run(
 					source.set_property("max-buffers", 4i32);
 					source
 				} else {
-					x11_source(settings.cursor)?
+					x11_source(settings.cursor).map_err(Cow::Borrowed)?
 				};
 				let probe = source.clone();
 				let capacity = send.clone();
@@ -229,20 +251,30 @@ pub(super) fn run(
 				let mut active_bitrate = bitrate
 					.load(Ordering::Acquire)
 					.clamp(250_000, effective_max_bitrate);
-				let Ok(pipeline) = Capture::new_with_limits(
+				let pipeline_high_profile = is_p2p
+					&& mode.supports_high_profile()
+					&& ready.load(Ordering::Acquire)
+					&& (peer_caps.load(Ordering::Acquire) & CAP_H264_HIGH) != 0;
+				let pipeline = match Capture::new_with_limits(
 					settings,
 					mode,
 					active_bitrate,
 					effective_max_bitrate,
 					max_encoded_bytes,
+					is_p2p,
+					pipeline_high_profile,
 					source,
 					stop.clone(),
 					ready.clone(),
 					keyframe.clone(),
 					move || capacity.capacity() > 0,
-				) else {
-					note("mode_unavailable", mode.label());
-					continue;
+				) {
+					Ok(pipeline) => pipeline,
+					Err(reason) => {
+						note("mode_build_failed", &reason);
+						last_error = Some(reason.into_owned());
+						continue;
+					}
 				};
 				note("mode", mode.label());
 				if let Ok(mut label) = status.lock() {
@@ -265,7 +297,7 @@ pub(super) fn run(
 						return Ok(());
 					}
 					if portal.as_mut().is_some_and(Portal::is_closed) {
-						return Err("The desktop stopped screen sharing");
+						return Err(Cow::Borrowed("The desktop stopped screen sharing"));
 					}
 					// Application audio is an extra, not the share itself. If its worker stops,
 					// keep sending video and say so, rather than ending the screen share.
@@ -320,8 +352,21 @@ pub(super) fn run(
 						resized = None;
 					}
 					if failed {
-						note("mode_failed", mode.label());
+						if let Some(detail) = pipeline.error_detail() {
+							note("mode_failed_detail", &detail);
+							last_error = Some(format!("{}: {detail}", mode.label()));
+						} else {
+							note("mode_failed", mode.label());
+						}
 						break;
+					}
+					let want_ready = ready.load(Ordering::Acquire);
+					if is_p2p && mode.supports_high_profile() && want_ready {
+						let desired_high = (peer_caps.load(Ordering::Acquire) & CAP_H264_HIGH) != 0;
+						if desired_high != pipeline_high_profile {
+							mode_index -= 1;
+							break;
+						}
 					}
 					let target = bitrate
 						.load(Ordering::Acquire)
@@ -329,13 +374,13 @@ pub(super) fn run(
 					// Let startup/recovery reach its existing deadline: changing targets must
 					// not repeatedly restart a failing encoder before fallback can run.
 					if target != active_bitrate && !waiting_keyframe {
-						if mode != Mode::Software && pipeline.set_bitrate(target) {
+						if mode.uses_gst_encoder() && pipeline.set_bitrate(target) {
 							active_bitrate = target;
 						} else if crate::screen::software_rate_change(active_bitrate, target) {
 							// Restarts cost an IDR, so only large moves apply. Older plugins
 							// cannot change rate while playing: reopen the same mode with a
 							// fresh PipeWire remote, keeping the approved portal.
-							if mode != Mode::Software {
+							if mode.uses_gst_encoder() {
 								mode_index -= 1;
 								break;
 							}
@@ -358,7 +403,8 @@ pub(super) fn run(
 						}
 					}
 					if let Some(sample) = pipeline.preview.try_pull_sample(gst::ClockTime::ZERO) {
-						let image = preview_frame(&capture::raw(&sample)?)?;
+						let image = preview_frame(&capture::raw(&sample).map_err(Cow::Borrowed)?)
+							.map_err(Cow::Borrowed)?;
 						if !noted_capture {
 							noted_capture = true;
 							captured.store(true, Ordering::Release);
@@ -372,9 +418,11 @@ pub(super) fn run(
 					if first_preview
 						.is_some_and(|start: Instant| start.elapsed() > Duration::from_secs(15))
 					{
+						last_error =
+							Some(format!("{}: timed out waiting for frames", mode.label()));
 						break;
 					}
-					if !ready.load(Ordering::Acquire) {
+					if !want_ready {
 						if let Ok(mut label) = status.lock()
 							&& *label != "Screen preview · waiting for others"
 						{
@@ -408,10 +456,12 @@ pub(super) fn run(
 							}
 							let pull = metrics.start();
 							metrics.finish(crate::diagnostics::Stage::Receive, pull);
-							let (data, is_keyframe) = if mode == Mode::Software {
-								let raw = capture::raw(&sample)?;
+							let (data, is_keyframe) = if !mode.uses_gst_encoder() {
+								let raw = capture::raw(&sample).map_err(Cow::Borrowed)?;
 								if raw.width != settings.width || raw.height != settings.height {
-									return Err("Screen frame dimensions changed unexpectedly");
+									return Err(Cow::Borrowed(
+										"Screen frame dimensions changed unexpectedly",
+									));
 								}
 								if software.is_none() {
 									software = Some((
@@ -419,7 +469,8 @@ pub(super) fn run(
 											settings,
 											active_bitrate,
 											effective_max_bitrate,
-										)?,
+										)
+										.map_err(Cow::Borrowed)?,
 										YUVBuffer::new(
 											settings.width as usize,
 											settings.height as usize,
@@ -436,19 +487,23 @@ pub(super) fn run(
 									(settings.width as usize, settings.height as usize),
 									keyframe.swap(false, Ordering::AcqRel) || waiting_keyframe,
 									max_encoded_bytes,
-								)?;
+								)
+								.map_err(Cow::Borrowed)?;
 								metrics.finish(crate::diagnostics::Stage::Encode, start);
 								encoded
 							} else {
-								let buffer =
-									sample.buffer().ok_or("Screen encoder returned no buffer")?;
+								let buffer = sample
+									.buffer()
+									.ok_or(Cow::Borrowed("Screen encoder returned no buffer"))?;
 								if buffer.size() > max_encoded_bytes {
-									return Err("Encoded screen frame exceeds the sharing limit");
+									return Err(Cow::Borrowed(
+										"Encoded screen frame exceeds the sharing limit",
+									));
 								}
 								let map = buffer
 									.map_readable()
-									.map_err(|_| "Screen video could not be read")?;
-								crate::video::validate_source(&map)?;
+									.map_err(|_| Cow::Borrowed("Screen video could not be read"))?;
+								crate::video::validate_source(&map).map_err(Cow::Borrowed)?;
 								(
 									map.to_vec(),
 									!buffer.flags().contains(gst::BufferFlags::DELTA_UNIT),
@@ -457,7 +512,10 @@ pub(super) fn run(
 							encoder_diagnostics.get_or_insert_with(|| {
 								crate::diagnostics::EncoderRegistration::new(
 									true,
-									mode != Mode::Software,
+									!matches!(
+										mode,
+										Mode::Software | Mode::SoftwareGl | Mode::SoftwareX264
+									),
 								)
 							});
 							if !data.is_empty() && (!waiting_keyframe || is_keyframe) {
@@ -491,6 +549,8 @@ pub(super) fn run(
 						}
 						// Only startup has a frame deadline: an unchanged desktop can stop producing frames.
 						if waiting_keyframe && started.elapsed() > Duration::from_secs(15) {
+							last_error =
+								Some(format!("{}: encoder delivered no keyframe", mode.label()));
 							break;
 						}
 					}
@@ -530,7 +590,14 @@ pub(super) fn run(
 				drop(pipeline);
 				drop(remote);
 			}
-			Err("No screen encoder could start; check PipeWire, portal and GStreamer plugins")
+			Err(match last_error {
+				Some(detail) => Cow::Owned(format!(
+					"No screen encoder could start ({detail}); check PipeWire, portal and GStreamer plugins"
+				)),
+				None => Cow::Borrowed(
+					"No screen encoder could start; check PipeWire, portal and GStreamer plugins",
+				),
+			})
 		}
 		.await;
 		ready.store(false, Ordering::Release);

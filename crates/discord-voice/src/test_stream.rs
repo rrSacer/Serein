@@ -131,6 +131,9 @@ async fn exchange(rekey_timeout: bool) {
 		ready: ready.clone(),
 		keyframe: keyframe.clone(),
 		bitrate: Arc::new(std::sync::atomic::AtomicU32::new(1_000_000)),
+		peer_caps: Arc::new(std::sync::atomic::AtomicU8::new(
+			crate::video_codec::CAP_H264_BASELINE,
+		)),
 		audio: Some(audio),
 		audio_epoch: epoch.clone(),
 	};

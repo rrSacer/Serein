@@ -2400,7 +2400,7 @@ screen-body-transport-discord = Discord
 # Context: body
 screen-body-bitrate = Bitrate
 # Context: body
-screen-body-p2p-note = Direct QUIC stream outside Discord's servers. Works over Tailscale or LAN.
+screen-body-p2p-note = Direct QUIC + BBR + Reed-Solomon FEC outside Discord's servers (Moonlight auto-bitrate). Works over Tailscale or LAN.
 # Context: body
 screen-body-post-p2p-invite = Send invite in call chat
 # Context: body

@@ -2316,7 +2316,7 @@ screen-body-transport-discord = Discord
 # Context: body
 screen-body-bitrate = Taxa de bits
 # Context: body
-screen-body-p2p-note = Transmissão direta via QUIC, fora da API do Discord. Ideal via Tailscale ou rede local.
+screen-body-p2p-note = Transmissão direta via QUIC + BBR + FEC (estilo Sunshine/Moonlight) com bitrate automático por resolução/FPS. Ideal via Tailscale ou rede local.
 # Context: body
 screen-body-post-p2p-invite = Enviar convite no chat da call
 # Context: body

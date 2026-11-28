@@ -8,6 +8,12 @@ pub(crate) enum Codec {
 	Av1,
 }
 
+/// Viewer decode capability bitmask advertised in the P2P v2 handshake.
+pub(crate) const CAP_H264_BASELINE: u8 = 0x01;
+pub(crate) const CAP_H264_HIGH: u8 = 0x02;
+pub(crate) const CAP_H265: u8 = 0x04;
+pub(crate) const CAP_AV1: u8 = 0x08;
+
 impl Codec {
 	pub fn from_name(name: &str) -> Option<Self> {
 		if name.eq_ignore_ascii_case("H264") {
@@ -20,12 +26,33 @@ impl Codec {
 			None
 		}
 	}
+	pub fn wire_id(self) -> u8 {
+		match self {
+			Self::H264 => 0,
+			Self::H265 => 1,
+			Self::Av1 => 2,
+		}
+	}
+	pub fn from_wire_id(id: u8) -> Option<Self> {
+		match id {
+			0 => Some(Self::H264),
+			1 => Some(Self::H265),
+			2 => Some(Self::Av1),
+			_ => None,
+		}
+	}
 	pub fn payload(self) -> u8 {
 		match self {
 			Self::H264 => 101,
 			Self::H265 => 103,
 			Self::Av1 => 105,
 		}
+	}
+	pub fn available_h264_high() -> bool {
+		#[cfg(target_os = "linux")]
+		return platform::video::live::supports_h264_high();
+		#[cfg(not(target_os = "linux"))]
+		true
 	}
 	pub fn available_h265() -> bool {
 		#[cfg(target_os = "linux")]
@@ -38,6 +65,20 @@ impl Codec {
 		return platform::video::live::H264Decoder::new_av1_timed(Box::new(|_, _| {})).is_ok();
 		#[cfg(not(target_os = "linux"))]
 		false
+	}
+	/// Bitmask of codecs this machine can decode in P2P receive mode.
+	pub fn local_decode_caps() -> u8 {
+		let mut caps = CAP_H264_BASELINE;
+		if Self::available_h264_high() {
+			caps |= CAP_H264_HIGH;
+		}
+		if Self::available_h265() {
+			caps |= CAP_H265;
+		}
+		if Self::available_av1() {
+			caps |= CAP_AV1;
+		}
+		caps
 	}
 	pub fn is_keyframe(self, frame: &[u8]) -> bool {
 		if self == Self::Av1 {

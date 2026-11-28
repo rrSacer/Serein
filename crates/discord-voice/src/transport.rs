@@ -2766,6 +2766,9 @@ mod tests {
 			ready: Arc::new(AtomicBool::new(true)),
 			keyframe: Arc::new(AtomicBool::new(false)),
 			bitrate: Arc::new(std::sync::atomic::AtomicU32::new(4_000_000)),
+			peer_caps: Arc::new(std::sync::atomic::AtomicU8::new(
+				crate::video_codec::CAP_H264_BASELINE,
+			)),
 			audio_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
 			audio: Some(receive),
 		});

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release tag (ex: v1.0.0-p2p.1)'
+        description: 'Release tag (ex: v1.0.0-p2p.2)'
         required: true
-        default: 'v1.0.0-p2p.1'
+        default: 'v1.0.0-p2p.2'
 
 permissions:
   contents: write
@@ -60,9 +60,9 @@ jobs:
           draft: false
           prerelease: false
           body: |
-            ## Serein P2P — Transmissão de Tela Direta via QUIC / Tailscale / LAN
+            ## Serein P2P — Transmissão de Tela Direta (QUIC / Tailscale / LAN)
 
-            Esta versão customizada do Serein permite compartilhar tela diretamente por P2P de alta fidelidade e baixíssima latência (60–165 fps), contornando limitações de rota da infraestrutura de mídia do Discord e sem exigir Nitro ou permissões de servidor.
+            Esta versão customizada do Serein traz sincronia com o upstream, correções de captura no Linux, transporte estilo **Sunshine/Moonlight** (BBR, PMTUD, FEC Reed-Solomon Cauchy GF(2⁸), VBR/High Profile), **Auto-Bitrate do Moonlight** até 150 Mbps e **suporte completo sem codec de hardware**.
 
             ### 🚀 Instalação Rápida no Linux (x86_64)
 

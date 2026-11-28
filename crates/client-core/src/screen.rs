@@ -48,7 +48,7 @@ pub enum Resolution {
 
 pub const MAX_SHARE_WIDTH: u32 = 3840;
 pub const MAX_SHARE_HEIGHT: u32 = 2160;
-pub const MAX_P2P_BITRATE_BPS: u32 = 60_000_000;
+pub const MAX_P2P_BITRATE_BPS: u32 = 150_000_000;
 
 /// Smallest to largest, so the quality row reads 480p … 2160p, then Source.
 const PRESETS: [Resolution; 5] = [
@@ -106,6 +106,44 @@ pub fn offered_p2p_frame_rates(refresh_hz: u32) -> impl Iterator<Item = u32> {
 		.filter(move |fps| refresh_hz == 0 || *fps <= 60 || refresh_hz >= *fps)
 }
 
+/// Calculates Moonlight's default bitrate in bits per second for a given resolution and FPS
+/// (matching `StreamingPreferences::getDefaultBitrate` in moonlight-qt).
+pub fn moonlight_default_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
+	let pixels =
+		(f64::from(width.max(1)) * f64::from(height.max(1))).clamp(640.0 * 360.0, 3840.0 * 2160.0);
+	let fps_f = f64::from(fps.max(1));
+	let frame_rate_factor = if fps_f <= 60.0 {
+		fps_f
+	} else {
+		(fps_f / 60.0).sqrt() * 60.0
+	} / 30.0;
+
+	const RESOLUTION_FACTORS: [(f64, f64); 6] = [
+		(640.0 * 360.0, 1.0),
+		(854.0 * 480.0, 2.0),
+		(1280.0 * 720.0, 5.0),
+		(1920.0 * 1080.0, 10.0),
+		(2560.0 * 1440.0, 20.0),
+		(3840.0 * 2160.0, 40.0),
+	];
+	let mut resolution_factor = RESOLUTION_FACTORS[0].1;
+	for pair in RESOLUTION_FACTORS.windows(2) {
+		let (p0, r0) = pair[0];
+		let (p1, r1) = pair[1];
+		if pixels <= p1 {
+			let t = (pixels - p0) / (p1 - p0);
+			resolution_factor = r0 + t * (r1 - r0);
+			break;
+		}
+		resolution_factor = r1;
+	}
+
+	let mbps = (resolution_factor * frame_rate_factor).round().max(1.0);
+	let bps = (mbps * 1_000_000.0).round() as u64;
+	u32::try_from(bps.clamp(1_000_000, u64::from(MAX_P2P_BITRATE_BPS)))
+		.unwrap_or(MAX_P2P_BITRATE_BPS)
+}
+
 /// Transport chosen inside the native screen-share dialog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ShareTransport {
@@ -124,16 +162,20 @@ pub enum P2pBitrate {
 	Mbps25,
 	Mbps40,
 	Mbps60,
+	Mbps100,
+	Mbps150,
 }
 
 impl P2pBitrate {
-	pub const ALL: [Self; 6] = [
+	pub const ALL: [Self; 8] = [
 		Self::Auto,
 		Self::Mbps8,
 		Self::Mbps16,
 		Self::Mbps25,
 		Self::Mbps40,
 		Self::Mbps60,
+		Self::Mbps100,
+		Self::Mbps150,
 	];
 
 	pub fn bps(self, settings: Settings) -> u32 {
@@ -144,17 +186,21 @@ impl P2pBitrate {
 			Self::Mbps25 => 25_000_000,
 			Self::Mbps40 => 40_000_000,
 			Self::Mbps60 => 60_000_000,
+			Self::Mbps100 => 100_000_000,
+			Self::Mbps150 => 150_000_000,
 		}
 	}
 
 	pub fn label(self) -> &'static str {
 		match self {
-			Self::Auto => "Auto (Gamer)",
+			Self::Auto => "Auto (Moonlight)",
 			Self::Mbps8 => "8 Mbps",
 			Self::Mbps16 => "16 Mbps",
 			Self::Mbps25 => "25 Mbps",
 			Self::Mbps40 => "40 Mbps",
 			Self::Mbps60 => "60 Mbps",
+			Self::Mbps100 => "100 Mbps",
+			Self::Mbps150 => "150 Mbps",
 		}
 	}
 }
@@ -283,7 +329,9 @@ pub fn extract_p2p_links(content: &str) -> Vec<P2pLinkInfo> {
 			break;
 		}
 		if let Some(info) = parse_p2p_link(token)
-			&& !links.iter().any(|existing: &P2pLinkInfo| existing.raw == info.raw)
+			&& !links
+				.iter()
+				.any(|existing: &P2pLinkInfo| existing.raw == info.raw)
 		{
 			links.push(info);
 		}
@@ -399,29 +447,9 @@ impl Settings {
 		base.saturating_mul(scale).min(16_000_000)
 	}
 
-	/// Target bitrate for gamer P2P streams (no Discord 16 Mbps cap).
+	/// Target bitrate for gamer P2P streams using Moonlight's default bitrate formula.
 	pub fn p2p_bit_rate(self) -> u32 {
-		let pixels = u64::from(self.width) * u64::from(self.height);
-		let base: u64 = if pixels <= 854 * 480 {
-			4_000_000
-		} else if pixels <= 1280 * 720 {
-			8_000_000
-		} else if pixels <= 1920 * 1080 {
-			16_000_000
-		} else if pixels <= 2560 * 1440 {
-			25_000_000
-		} else {
-			36_000_000
-		};
-		let scaled = match self.fps {
-			144 | 165 => base.saturating_mul(2),
-			120 => base.saturating_mul(16) / 10,
-			90 => base.saturating_mul(14) / 10,
-			60 => base.saturating_mul(125) / 100,
-			_ => base,
-		};
-		u32::try_from(scaled.clamp(2_000_000, u64::from(MAX_P2P_BITRATE_BPS)))
-			.unwrap_or(MAX_P2P_BITRATE_BPS)
+		moonlight_default_bitrate_bps(self.width, self.height, self.fps)
 	}
 }
 
@@ -474,8 +502,23 @@ mod tests {
 			audio: true,
 		};
 		assert!(hd_144.valid());
-		assert!(hd_144.p2p_bit_rate() >= 30_000_000);
+		assert_eq!(hd_144.p2p_bit_rate(), 31_000_000);
 		assert_eq!(P2pBitrate::Mbps60.bps(hd_144), 60_000_000);
+		assert_eq!(P2pBitrate::Mbps150.bps(hd_144), 150_000_000);
+	}
+
+	#[test]
+	fn moonlight_auto_bitrate_matches_reference_points() {
+		assert_eq!(moonlight_default_bitrate_bps(1280, 720, 30), 5_000_000);
+		assert_eq!(moonlight_default_bitrate_bps(1280, 720, 60), 10_000_000);
+		assert_eq!(moonlight_default_bitrate_bps(1920, 1080, 30), 10_000_000);
+		assert_eq!(moonlight_default_bitrate_bps(1920, 1080, 60), 20_000_000);
+		assert_eq!(moonlight_default_bitrate_bps(1920, 1080, 120), 28_000_000);
+		assert_eq!(moonlight_default_bitrate_bps(2560, 1440, 60), 40_000_000);
+		assert_eq!(moonlight_default_bitrate_bps(2560, 1440, 120), 57_000_000);
+		assert_eq!(moonlight_default_bitrate_bps(2560, 1440, 144), 62_000_000);
+		assert_eq!(moonlight_default_bitrate_bps(3840, 2160, 60), 80_000_000);
+		assert_eq!(moonlight_default_bitrate_bps(3840, 2160, 120), 113_000_000);
 	}
 
 	#[test]

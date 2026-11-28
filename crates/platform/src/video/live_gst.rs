@@ -13,6 +13,33 @@ use std::sync::{
 
 /// Probe decoder capabilities before advertising HEVC or AV1. Never advertise a codec just
 /// because its parser exists; decodebin also needs an installed ranked decoder.
+pub fn supports_h264() -> bool {
+	supports_codec("h264parse", "video/x-h264")
+}
+/// True when GStreamer has a High-Profile capable H.264 decoder (anything other than
+/// `openh264dec`, which only handles Constrained Baseline).
+pub fn supports_h264_high() -> bool {
+	if gst::init().is_err() || gst::ElementFactory::find("h264parse").is_none() {
+		return false;
+	}
+	let caps = gst::Caps::builder("video/x-h264").build();
+	gst::ElementFactory::factories_with_type(
+		gst::ElementFactoryType::DECODER | gst::ElementFactoryType::MEDIA_VIDEO,
+		gst::Rank::MARGINAL,
+	)
+	.iter()
+	.any(|factory| {
+		if factory.name() == "openh264dec" || !factory.can_sink_any_caps(&caps) {
+			return false;
+		}
+		let Ok(decoder) = factory.create().build() else {
+			return false;
+		};
+		let available = decoder.set_state(gst::State::Ready).is_ok();
+		let _ = decoder.set_state(gst::State::Null);
+		available
+	})
+}
 pub fn supports_h265() -> bool {
 	supports_codec("h265parse", "video/x-h265")
 }
@@ -40,6 +67,7 @@ fn supports_codec(parser: &str, media: &str) -> bool {
 }
 
 const MAX_QUEUED_UNITS: u64 = 4;
+#[cfg(test)]
 const MAX_QUEUED_BYTES: u64 = MAX_QUEUED_UNITS * MAX_ACCESS_UNIT as u64;
 
 /// Decoder for one sender; pictures arrive through the sink from GStreamer's thread.
@@ -49,6 +77,8 @@ pub struct H264Decoder {
 	failed: Arc<AtomicBool>,
 	delivered: Arc<AtomicU64>,
 	pictures: u64,
+	max_access_unit: usize,
+	max_queued_bytes: u64,
 }
 
 impl Drop for H264Decoder {
@@ -62,20 +92,62 @@ impl H264Decoder {
 		Self::new_timed(Box::new(move |frame, _| sink(frame)))
 	}
 	pub fn new_timed(sink: super::TimedLiveSink) -> Result<Self, &'static str> {
-		Self::new_codec(sink, "video/x-h264", "h264parse", "byte-stream", "au")
+		Self::new_timed_with_limit(sink, MAX_ACCESS_UNIT)
+	}
+	pub fn new_timed_with_limit(
+		sink: super::TimedLiveSink,
+		max_access_unit: usize,
+	) -> Result<Self, &'static str> {
+		if !supports_h264() {
+			return Err(UNSUPPORTED);
+		}
+		Self::new_codec(
+			sink,
+			"video/x-h264",
+			"h264parse",
+			"byte-stream",
+			"au",
+			max_access_unit,
+		)
 	}
 	/// Receive-only HEVC uses the same bounded queues, picture layout and timing tags.
 	pub fn new_h265_timed(sink: super::TimedLiveSink) -> Result<Self, &'static str> {
+		Self::new_h265_timed_with_limit(sink, MAX_ACCESS_UNIT)
+	}
+	pub fn new_h265_timed_with_limit(
+		sink: super::TimedLiveSink,
+		max_access_unit: usize,
+	) -> Result<Self, &'static str> {
 		if !supports_h265() {
 			return Err(UNSUPPORTED);
 		}
-		Self::new_codec(sink, "video/x-h265", "h265parse", "byte-stream", "au")
+		Self::new_codec(
+			sink,
+			"video/x-h265",
+			"h265parse",
+			"byte-stream",
+			"au",
+			max_access_unit,
+		)
 	}
 	pub fn new_av1_timed(sink: super::TimedLiveSink) -> Result<Self, &'static str> {
+		Self::new_av1_timed_with_limit(sink, MAX_ACCESS_UNIT)
+	}
+	pub fn new_av1_timed_with_limit(
+		sink: super::TimedLiveSink,
+		max_access_unit: usize,
+	) -> Result<Self, &'static str> {
 		if !supports_codec("av1parse", "video/x-av1") {
 			return Err(UNSUPPORTED);
 		}
-		Self::new_codec(sink, "video/x-av1", "av1parse", "obu-stream", "tu")
+		Self::new_codec(
+			sink,
+			"video/x-av1",
+			"av1parse",
+			"obu-stream",
+			"tu",
+			max_access_unit,
+		)
 	}
 	fn new_codec(
 		sink: super::TimedLiveSink,
@@ -83,7 +155,10 @@ impl H264Decoder {
 		parser: &str,
 		format: &str,
 		alignment: &str,
+		max_access_unit: usize,
 	) -> Result<Self, &'static str> {
+		let max_access_unit = max_access_unit.max(MAX_ACCESS_UNIT);
+		let max_queued_bytes = MAX_QUEUED_UNITS * max_access_unit as u64;
 		gst::init().map_err(|_| UNSUPPORTED)?;
 		let pipeline = gst::Pipeline::new();
 		let appsrc = gst_app::AppSrc::builder()
@@ -103,7 +178,7 @@ impl H264Decoder {
 		if appsrc.find_property("current-level-buffers").is_none() {
 			return Err(UNSUPPORTED);
 		}
-		appsrc.set_max_bytes(MAX_QUEUED_BYTES);
+		appsrc.set_max_bytes(max_queued_bytes);
 		appsrc.set_block(false);
 		let parse = make(parser)?;
 		let decodebin = make("decodebin")?;
@@ -201,6 +276,8 @@ impl H264Decoder {
 			failed,
 			delivered,
 			pictures: 0,
+			max_access_unit,
+			max_queued_bytes,
 		})
 	}
 
@@ -212,7 +289,7 @@ impl H264Decoder {
 		if tag > i64::MAX as u64 / 1_000_000 {
 			return Err(INVALID);
 		}
-		if access_unit.len() > MAX_ACCESS_UNIT {
+		if access_unit.len() > self.max_access_unit {
 			return Err(INVALID);
 		}
 		// max-bytes only emits enough-data when block=false; it does not reject pushes.
@@ -222,7 +299,7 @@ impl H264Decoder {
 				.appsrc
 				.current_level_bytes()
 				.saturating_add(access_unit.len() as u64)
-				> MAX_QUEUED_BYTES
+				> self.max_queued_bytes
 		{
 			return Err(BUSY);
 		}
@@ -293,6 +370,8 @@ mod tests {
 				failed: Arc::default(),
 				delivered: Arc::default(),
 				pictures: 0,
+				max_access_unit: MAX_ACCESS_UNIT,
+				max_queued_bytes: MAX_QUEUED_BYTES,
 			};
 			// A live appsrc consumes only while Playing. Null would flush it and reject
 			// pushes for a lifecycle reason instead of exercising the actual queue limit.

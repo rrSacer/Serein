@@ -399,10 +399,18 @@ impl ScreenUi {
 				colors.muted,
 			));
 			ui.add_space(6.0);
+			let auto_label = self
+				.settings()
+				.map(|s| format!("Auto (Moonlight · {} Mbps)", s.p2p_bit_rate() / 1_000_000));
 			ui.horizontal_wrapped(|ui| {
 				ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
 				for option in P2pBitrate::ALL {
-					if segment(ui, option.label(), self.bitrate == option).clicked() {
+					let label = if option == P2pBitrate::Auto {
+						auto_label.as_deref().unwrap_or(option.label())
+					} else {
+						option.label()
+					};
+					if segment(ui, label, self.bitrate == option).clicked() {
 						self.bitrate = option;
 					}
 				}

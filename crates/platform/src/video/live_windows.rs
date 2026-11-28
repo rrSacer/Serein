@@ -33,6 +33,7 @@ pub struct H264Decoder {
 	pictures: i64,
 	output: Option<OutputFormat>,
 	provides_samples: bool,
+	max_access_unit: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -48,6 +49,12 @@ impl H264Decoder {
 		Self::new_timed(Box::new(move |frame, _| sink(frame)))
 	}
 	pub fn new_timed(sink: super::TimedLiveSink) -> Result<Self, &'static str> {
+		Self::new_timed_with_limit(sink, MAX_ACCESS_UNIT)
+	}
+	pub fn new_timed_with_limit(
+		sink: super::TimedLiveSink,
+		max_access_unit: usize,
+	) -> Result<Self, &'static str> {
 		let runtime = Runtime::open()?;
 		// SAFETY: Plain COM/Media Foundation calls on the thread that initialized the runtime;
 		// every out-pointer refers to an initialized local.
@@ -78,6 +85,7 @@ impl H264Decoder {
 				pictures: 0,
 				output: None,
 				provides_samples: false,
+				max_access_unit: max_access_unit.max(MAX_ACCESS_UNIT),
 			};
 			decoder.negotiate_output()?;
 			decoder
@@ -100,7 +108,7 @@ impl H264Decoder {
 		if tag > i64::MAX as u64 / 1_000_000 {
 			return Err(INVALID);
 		}
-		if access_unit.len() > MAX_ACCESS_UNIT || access_unit.is_empty() {
+		if access_unit.len() > self.max_access_unit || access_unit.is_empty() {
 			return Err(INVALID);
 		}
 		// SAFETY: Buffer length is validated before the copy; Lock is balanced by Unlock.

@@ -1,17 +1,22 @@
 //! Direct low-latency QUIC P2P screen and audio streaming (Tailscale & LAN ready).
 //! Bypasses Discord's Go Live media servers with 1-click `serein-p2p://` links,
-//! ephemeral ECDSA TLS 1.3 cert pinning, per-GOP QUIC uni-streams (no cross-GOP
-//! head-of-line blocking), and QUIC datagrams for 48 kHz stereo Opus audio.
+//! ephemeral ECDSA TLS 1.3 cert pinning, QUIC BBR congestion control + PMTUD,
+//! Cauchy Reed-Solomon FEC over QUIC datagrams (zero Head-of-Line blocking) with
+//! seamless per-GOP uni-stream fallback for jumbo keyframes, and 48 kHz stereo Opus audio.
 #![forbid(unsafe_code)]
 
+use crate::p2p_fec::{DEFAULT_FEC_PERCENT, FecAssembler, encode_frame};
 use crate::screen::Video;
-use crate::video_codec::Codec;
-use crate::video_receive::{Encoded, P2P_MAX_FRAME_BYTES, VideoSink, offer, spawn_p2p_decoder};
+use crate::video_codec::{CAP_H264_BASELINE, Codec};
+use crate::video_receive::{
+	DecoderQueue, Encoded, P2P_MAX_FRAME_BYTES, VideoSink, offer, spawn_p2p_decoder,
+};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use opus2::{Application, Bitrate, Channels, Decoder as OpusDecoder, Encoder as OpusEncoder};
+use quinn::congestion::BbrConfig;
 use quinn::{
-	ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig,
-	TransportConfig, VarInt,
+	ClientConfig, Connection, Endpoint, IdleTimeout, MtuDiscoveryConfig, RecvStream, SendStream,
+	ServerConfig, TransportConfig, VarInt,
 };
 use ring::digest::{SHA256, digest};
 use rustls::DigitallySignedStruct;
@@ -20,7 +25,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{
 	Arc, Mutex,
-	atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
+	atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -33,15 +38,23 @@ pub const SCHEME: &str = "serein-p2p";
 pub const MAX_VIEWERS: usize = 8;
 
 const ALPN: &[u8] = b"serein-p2p/1";
-const AUTH_MAGIC: [u8; 5] = *b"SP2P\x01";
+const AUTH_MAGIC_V1: [u8; 5] = *b"SP2P\x01";
+const AUTH_MAGIC_V2: [u8; 5] = *b"SP2P\x02";
 const AUTH_OK: u8 = 0x01;
 const AUTH_FULL: u8 = 0x02;
 const CTRL_PLI: u8 = 0x01;
+const CTRL_FEEDBACK: u8 = 0x02;
 const AUDIO_TAG: u8 = b'A';
+const VIDEO_TAG: u8 = b'V';
 const AUDIO_HEADER_LEN: usize = 9;
+const VIDEO_DGRAM_HEADER_LEN: usize = 17;
+const VIDEO_STREAM_V1_HEADER_LEN: usize = 9;
+const VIDEO_STREAM_V2_HEADER_LEN: usize = 14;
 const AUDIO_FRAME_FRAMES: usize = 960;
 const AUDIO_FRAME_FLOATS: usize = AUDIO_FRAME_FRAMES * 2;
 const MAX_AUDIO_DGRAM: usize = 1150;
+const MAX_REORDER_SLOTS: usize = 4;
+const REORDER_TIMEOUT: Duration = Duration::from_millis(40);
 const QUIC_KEEPALIVE: Duration = Duration::from_secs(2);
 const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -284,17 +297,18 @@ impl Default for P2pHostConfig {
 
 fn build_transport_config() -> TransportConfig {
 	let mut transport = TransportConfig::default();
+	transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
 	transport.initial_mtu(1200);
-	transport.mtu_discovery_config(None);
-	transport.receive_window(VarInt::from_u32(4 * 1024 * 1024));
-	transport.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024));
-	transport.send_window(2 * 1024 * 1024);
+	transport.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
+	transport.receive_window(VarInt::from_u32(8 * 1024 * 1024));
+	transport.stream_receive_window(VarInt::from_u32(4 * 1024 * 1024));
+	transport.send_window(4 * 1024 * 1024);
 	transport.keep_alive_interval(Some(QUIC_KEEPALIVE));
 	transport.max_idle_timeout(IdleTimeout::try_from(QUIC_IDLE_TIMEOUT).ok());
-	transport.datagram_receive_buffer_size(Some(256 * 1024));
-	transport.datagram_send_buffer_size(256 * 1024);
+	transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
+	transport.datagram_send_buffer_size(2 * 1024 * 1024);
 	transport.max_concurrent_bidi_streams(VarInt::from_u32(4));
-	transport.max_concurrent_uni_streams(VarInt::from_u32(8));
+	transport.max_concurrent_uni_streams(VarInt::from_u32(16));
 	transport
 }
 
@@ -411,6 +425,8 @@ fn build_client_config(expected_sha256: [u8; 32]) -> Result<ClientConfig, String
 #[derive(Clone)]
 struct EncodedPacket {
 	gop_id: u64,
+	frame_id: u32,
+	codec: Codec,
 	keyframe: bool,
 	timestamp: u32,
 	data: Vec<u8>,
@@ -418,6 +434,7 @@ struct EncodedPacket {
 
 struct ViewerSlot {
 	id: u64,
+	caps: u8,
 	conn: Connection,
 	video_tx: mpsc::Sender<Arc<EncodedPacket>>,
 }
@@ -428,8 +445,13 @@ struct HostShared {
 	height: u32,
 	fps: u32,
 	has_audio: bool,
+	initial_bitrate_bps: u32,
 	video_ready: Arc<AtomicBool>,
 	video_keyframe: Arc<AtomicBool>,
+	video_bitrate: Arc<AtomicU32>,
+	peer_caps: Arc<AtomicU8>,
+	fec_percent: Arc<AtomicU8>,
+	last_rate_adjust: Mutex<Instant>,
 	next_viewer_id: AtomicU64,
 	viewers: Mutex<Vec<ViewerSlot>>,
 	stats_tx: watch::Sender<P2pHostStats>,
@@ -442,13 +464,34 @@ impl HostShared {
 	}
 
 	fn update_viewer_state(&self) {
-		let count = self.viewer_count();
+		let (count, combined_caps) = match self.viewers.lock() {
+			Ok(list) => {
+				let combined = if list.is_empty() {
+					CAP_H264_BASELINE
+				} else {
+					list.iter()
+						.fold(0xffu8, |acc, v| acc & (v.caps | CAP_H264_BASELINE))
+				};
+				(list.len(), combined)
+			}
+			Err(_) => (0, CAP_H264_BASELINE),
+		};
+
+		let prev_caps = self.peer_caps.swap(combined_caps, Ordering::AcqRel);
 		if count > 0 {
+			if prev_caps != combined_caps {
+				self.video_keyframe.store(true, Ordering::Release);
+			}
 			self.video_keyframe.store(true, Ordering::Release);
 			self.video_ready.store(true, Ordering::Release);
 		} else {
 			self.video_ready.store(false, Ordering::Release);
+			self.video_bitrate
+				.store(self.initial_bitrate_bps, Ordering::Release);
+			self.fec_percent
+				.store(DEFAULT_FEC_PERCENT as u8, Ordering::Release);
 		}
+
 		self.stats_tx.send_modify(|s| {
 			s.viewers = count;
 			if count > 0 {
@@ -470,6 +513,48 @@ impl HostShared {
 			list.retain(|entry| entry.id != id);
 		}
 		self.update_viewer_state();
+	}
+
+	fn apply_viewer_feedback(&self, rtt_ms: u16, loss_per_mille: u16, fec_per_mille: u16) {
+		let Ok(mut last_adjust) = self.last_rate_adjust.lock() else {
+			return;
+		};
+		if last_adjust.elapsed() < Duration::from_millis(400) && loss_per_mille < 20 {
+			return;
+		}
+		*last_adjust = Instant::now();
+
+		let ceiling = self.initial_bitrate_bps;
+		let floor = (ceiling / 4).max(1_000_000).min(ceiling);
+		let current = self
+			.video_bitrate
+			.load(Ordering::Acquire)
+			.clamp(floor, ceiling);
+
+		let next_bitrate = if loss_per_mille >= 20 {
+			self.fec_percent.store(30, Ordering::Release);
+			(current.saturating_mul(4) / 5).max(floor)
+		} else if fec_per_mille >= 150 || rtt_ms > 250 {
+			self.fec_percent.store(25, Ordering::Release);
+			(current.saturating_mul(9) / 10).max(floor)
+		} else if fec_per_mille >= 50 || rtt_ms > 180 {
+			self.fec_percent.store(25, Ordering::Release);
+			current
+		} else {
+			let cur_fec = self.fec_percent.load(Ordering::Acquire);
+			if cur_fec > DEFAULT_FEC_PERCENT as u8 {
+				self.fec_percent.store(
+					cur_fec.saturating_sub(2).max(DEFAULT_FEC_PERCENT as u8),
+					Ordering::Release,
+				);
+			}
+			let step = (ceiling / 10).max(500_000);
+			current.saturating_add(step).min(ceiling)
+		};
+
+		if next_bitrate != current {
+			self.video_bitrate.store(next_bitrate, Ordering::Release);
+		}
 	}
 }
 
@@ -556,8 +641,13 @@ async fn run_p2p_host_with_bind(
 		height: video.settings.height,
 		fps: video.settings.fps,
 		has_audio: video.audio.is_some(),
+		initial_bitrate_bps: initial_bps,
 		video_ready: video.ready.clone(),
 		video_keyframe: video.keyframe.clone(),
+		video_bitrate: video.bitrate.clone(),
+		peer_caps: video.peer_caps.clone(),
+		fec_percent: Arc::new(AtomicU8::new(DEFAULT_FEC_PERCENT as u8)),
+		last_rate_adjust: Mutex::new(Instant::now() - Duration::from_secs(1)),
 		next_viewer_id: AtomicU64::new(1),
 		viewers: Mutex::new(Vec::new()),
 		stats_tx: stats.clone(),
@@ -579,6 +669,7 @@ async fn run_p2p_host_with_bind(
 	let video_keyframe_flag = video.keyframe.clone();
 	tasks.spawn(async move {
 		let mut gop_id = 0u64;
+		let mut frame_id = 0u32;
 		let mut frames_window = 0u32;
 		let mut bytes_window = 0u64;
 		let mut window_start = Instant::now();
@@ -590,11 +681,17 @@ async fn run_p2p_host_with_bind(
 			} else if gop_id == 0 {
 				gop_id = 1;
 			}
+			frame_id = frame_id.wrapping_add(1);
+			if frame_id == 0 {
+				frame_id = 1;
+			}
 			frames_window = frames_window.saturating_add(1);
 			bytes_window = bytes_window.saturating_add(frame.data.len() as u64);
 
 			let packet = Arc::new(EncodedPacket {
 				gop_id,
+				frame_id,
+				codec: Codec::H264,
 				keyframe: frame.keyframe,
 				timestamp: frame.timestamp,
 				data: frame.data,
@@ -649,6 +746,49 @@ async fn run_p2p_host_with_bind(
 	Ok(())
 }
 
+async fn try_send_fec_datagrams(
+	conn: &Connection,
+	packet: &EncodedPacket,
+	fec_percent: usize,
+) -> bool {
+	let Some(max_dgram) = conn.max_datagram_size() else {
+		return false;
+	};
+	if max_dgram < 400 {
+		return false;
+	}
+	let max_shard_payload = (max_dgram - VIDEO_DGRAM_HEADER_LEN).min(1180);
+	let Some(block) = encode_frame(&packet.data, max_shard_payload, fec_percent) else {
+		return false;
+	};
+	let Ok(frame_len) = u32::try_from(block.frame_len) else {
+		return false;
+	};
+	let flags = u8::from(packet.keyframe) | ((packet.codec.wire_id() & 0x07) << 1);
+	let mut header = [0u8; VIDEO_DGRAM_HEADER_LEN];
+	header[0] = VIDEO_TAG;
+	header[1..5].copy_from_slice(&packet.frame_id.to_be_bytes());
+	header[5..9].copy_from_slice(&packet.timestamp.to_be_bytes());
+	header[9] = flags;
+	header[10] = block.data_shards;
+	header[11] = block.parity_shards;
+	header[13..17].copy_from_slice(&frame_len.to_be_bytes());
+
+	for (idx, shard) in block.shards.iter().enumerate() {
+		header[12] = idx as u8;
+		let mut buf = Vec::with_capacity(VIDEO_DGRAM_HEADER_LEN + shard.len());
+		buf.extend_from_slice(&header);
+		buf.extend_from_slice(shard);
+		if conn.send_datagram(buf.into()).is_err() {
+			return false;
+		}
+		if (idx + 1).is_multiple_of(8) {
+			tokio::task::yield_now().await;
+		}
+	}
+	true
+}
+
 async fn handle_viewer_connection(conn: Connection, shared: Arc<HostShared>) -> Result<(), ()> {
 	let (mut ctrl_send, mut ctrl_recv) =
 		tokio::time::timeout(Duration::from_secs(5), conn.accept_bi())
@@ -661,12 +801,25 @@ async fn handle_viewer_connection(conn: Connection, shared: Arc<HostShared>) -> 
 		.map_err(|_| ())?
 		.map_err(|_| ())?;
 
-	if auth_buf[..5] != AUTH_MAGIC || !bool::from(auth_buf[5..21].ct_eq(&shared.token)) {
+	let is_v2 = auth_buf[..5] == AUTH_MAGIC_V2;
+	let is_v1 = auth_buf[..5] == AUTH_MAGIC_V1;
+	if (!is_v1 && !is_v2) || !bool::from(auth_buf[5..21].ct_eq(&shared.token)) {
 		let _ = ctrl_send.write_all(&[0x00]).await;
 		let _ = ctrl_send.finish();
 		conn.close(1u32.into(), b"unauthorized");
 		return Err(());
 	}
+
+	let viewer_caps = if is_v2 {
+		let mut cap_buf = [0u8; 1];
+		tokio::time::timeout(Duration::from_secs(5), ctrl_recv.read_exact(&mut cap_buf))
+			.await
+			.map_err(|_| ())?
+			.map_err(|_| ())?;
+		cap_buf[0] | CAP_H264_BASELINE
+	} else {
+		CAP_H264_BASELINE
+	};
 
 	let (video_tx, mut video_rx) = mpsc::channel::<Arc<EncodedPacket>>(4);
 	let viewer_id = shared.next_viewer_id.fetch_add(1, Ordering::Relaxed);
@@ -677,6 +830,7 @@ async fn handle_viewer_connection(conn: Connection, shared: Arc<HostShared>) -> 
 		} else {
 			list.push(ViewerSlot {
 				id: viewer_id,
+				caps: viewer_caps,
 				conn: conn.clone(),
 				video_tx,
 			});
@@ -711,12 +865,24 @@ async fn handle_viewer_connection(conn: Connection, shared: Arc<HostShared>) -> 
 		let mut opcode = [0u8; 1];
 		let mut last_pli = None::<Instant>;
 		while ctrl_recv.read_exact(&mut opcode).await.is_ok() {
-			if opcode[0] != CTRL_PLI {
-				break;
-			}
-			if last_pli.is_none_or(|last| last.elapsed() >= Duration::from_millis(250)) {
-				last_pli = Some(Instant::now());
-				ctrl_shared.video_keyframe.store(true, Ordering::Release);
+			match opcode[0] {
+				CTRL_PLI => {
+					if last_pli.is_none_or(|last| last.elapsed() >= Duration::from_millis(250)) {
+						last_pli = Some(Instant::now());
+						ctrl_shared.video_keyframe.store(true, Ordering::Release);
+					}
+				}
+				CTRL_FEEDBACK => {
+					let mut fb = [0u8; 6];
+					if ctrl_recv.read_exact(&mut fb).await.is_err() {
+						break;
+					}
+					let rtt_ms = u16::from_be_bytes([fb[0], fb[1]]);
+					let loss_pm = u16::from_be_bytes([fb[2], fb[3]]);
+					let fec_pm = u16::from_be_bytes([fb[4], fb[5]]);
+					ctrl_shared.apply_viewer_feedback(rtt_ms, loss_pm, fec_pm);
+				}
+				_ => break,
 			}
 		}
 		ctrl_conn.close(0u32.into(), b"control closed");
@@ -724,7 +890,8 @@ async fn handle_viewer_connection(conn: Connection, shared: Arc<HostShared>) -> 
 
 	let mut active_gop: Option<(u64, SendStream)> = None;
 	let mut need_keyframe = true;
-	let mut header = [0u8; 9];
+	let mut header_v1 = [0u8; VIDEO_STREAM_V1_HEADER_LEN];
+	let mut header_v2 = [0u8; VIDEO_STREAM_V2_HEADER_LEN];
 
 	while let Some(packet) = tokio::select! {
 		packet = video_rx.recv() => packet,
@@ -733,6 +900,26 @@ async fn handle_viewer_connection(conn: Connection, shared: Arc<HostShared>) -> 
 		if need_keyframe && !packet.keyframe {
 			continue;
 		}
+		let Ok(len) = u32::try_from(packet.data.len()) else {
+			continue;
+		};
+
+		if is_v2 {
+			let fec_pct = usize::from(shared.fec_percent.load(Ordering::Acquire));
+			if try_send_fec_datagrams(&conn, &packet, fec_pct).await {
+				if packet.keyframe
+					&& let Some((_, mut old_stream)) = active_gop.take()
+				{
+					let _ = old_stream.reset(0u32.into());
+				}
+				need_keyframe = false;
+				continue;
+			}
+			if conn.close_reason().is_some() {
+				break;
+			}
+		}
+
 		if packet.keyframe || active_gop.is_none() {
 			if let Some((_, mut old_stream)) = active_gop.take() {
 				let _ = old_stream.reset(0u32.into());
@@ -751,14 +938,21 @@ async fn handle_viewer_connection(conn: Connection, shared: Arc<HostShared>) -> 
 			continue;
 		}
 
-		let Ok(len) = u32::try_from(packet.data.len()) else {
-			continue;
+		let header: &[u8] = if is_v2 {
+			header_v2[0] = u8::from(packet.keyframe);
+			header_v2[1] = packet.codec.wire_id();
+			header_v2[2..6].copy_from_slice(&packet.frame_id.to_be_bytes());
+			header_v2[6..10].copy_from_slice(&packet.timestamp.to_be_bytes());
+			header_v2[10..14].copy_from_slice(&len.to_be_bytes());
+			&header_v2
+		} else {
+			header_v1[0] = u8::from(packet.keyframe);
+			header_v1[1..5].copy_from_slice(&packet.timestamp.to_be_bytes());
+			header_v1[5..9].copy_from_slice(&len.to_be_bytes());
+			&header_v1
 		};
-		header[0] = u8::from(packet.keyframe);
-		header[1..5].copy_from_slice(&packet.timestamp.to_be_bytes());
-		header[5..9].copy_from_slice(&len.to_be_bytes());
 		let sent = tokio::time::timeout(Duration::from_millis(250), async {
-			stream.write_all(&header).await?;
+			stream.write_all(header).await?;
 			stream.write_all(&packet.data).await
 		})
 		.await;
@@ -840,6 +1034,232 @@ async fn host_audio_loop(
 
 mod bytes_compat {
 	pub type Bytes = Vec<u8>;
+}
+
+struct PendingVideoFrame {
+	codec: Codec,
+	keyframe: bool,
+	data: Vec<u8>,
+}
+
+struct VideoOrderGate {
+	next_frame_id: Option<u32>,
+	awaiting_keyframe: bool,
+	pending: Vec<(u32, PendingVideoFrame)>,
+	last_progress: Instant,
+	decoder_dead: bool,
+	total_frames: u64,
+	fec_recovered_frames: u64,
+	lost_frames: u64,
+}
+
+impl Default for VideoOrderGate {
+	fn default() -> Self {
+		Self {
+			next_frame_id: None,
+			awaiting_keyframe: true,
+			pending: Vec::with_capacity(MAX_REORDER_SLOTS),
+			last_progress: Instant::now(),
+			decoder_dead: false,
+			total_frames: 0,
+			fec_recovered_frames: 0,
+			lost_frames: 0,
+		}
+	}
+}
+
+fn is_newer_frame(a: u32, b: u32) -> bool {
+	a != b && a.wrapping_sub(b) < 0x8000_0000
+}
+
+impl VideoOrderGate {
+	fn deliver_to_decoder(
+		&mut self,
+		codec: Codec,
+		keyframe: bool,
+		data: Vec<u8>,
+		decoder: &DecoderQueue,
+		pli_tx: &mpsc::Sender<()>,
+	) -> bool {
+		let frame = Encoded {
+			codec,
+			user: 1,
+			data,
+			keyframe,
+		};
+		match offer(decoder, frame) {
+			Ok(true) => true,
+			Ok(false) => {
+				self.awaiting_keyframe = true;
+				self.pending.clear();
+				let _ = pli_tx.try_send(());
+				false
+			}
+			Err(_) => {
+				self.decoder_dead = true;
+				self.pending.clear();
+				false
+			}
+		}
+	}
+
+	fn drain_contiguous(&mut self, decoder: &DecoderQueue, pli_tx: &mpsc::Sender<()>) {
+		while let Some(expected) = self.next_frame_id {
+			let Some(pos) = self.pending.iter().position(|(id, _)| *id == expected) else {
+				break;
+			};
+			let (_, frame) = self.pending.swap_remove(pos);
+			if !self.deliver_to_decoder(frame.codec, frame.keyframe, frame.data, decoder, pli_tx) {
+				break;
+			}
+			self.next_frame_id = Some(expected.wrapping_add(1));
+			self.last_progress = Instant::now();
+		}
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn push(
+		&mut self,
+		frame_id: u32,
+		codec: Codec,
+		keyframe: bool,
+		data: Vec<u8>,
+		fec_recovered: bool,
+		decoder: &DecoderQueue,
+		pli_tx: &mpsc::Sender<()>,
+	) {
+		if self.decoder_dead {
+			return;
+		}
+		self.total_frames += 1;
+		if fec_recovered {
+			self.fec_recovered_frames += 1;
+		}
+
+		let Some(expected) = self.next_frame_id else {
+			if !keyframe {
+				return;
+			}
+			if self.deliver_to_decoder(codec, true, data, decoder, pli_tx) {
+				self.next_frame_id = Some(frame_id.wrapping_add(1));
+				self.awaiting_keyframe = false;
+				self.last_progress = Instant::now();
+			}
+			return;
+		};
+
+		if frame_id != expected && !is_newer_frame(frame_id, expected) {
+			return;
+		}
+
+		if self.awaiting_keyframe {
+			if !keyframe {
+				return;
+			}
+			self.pending.retain(|(id, _)| is_newer_frame(*id, frame_id));
+			if self.deliver_to_decoder(codec, true, data, decoder, pli_tx) {
+				self.next_frame_id = Some(frame_id.wrapping_add(1));
+				self.awaiting_keyframe = false;
+				self.last_progress = Instant::now();
+				self.drain_contiguous(decoder, pli_tx);
+			}
+			return;
+		}
+
+		if frame_id == expected {
+			if self.deliver_to_decoder(codec, keyframe, data, decoder, pli_tx) {
+				self.next_frame_id = Some(expected.wrapping_add(1));
+				self.last_progress = Instant::now();
+				self.drain_contiguous(decoder, pli_tx);
+			}
+			return;
+		}
+
+		let gap = frame_id.wrapping_sub(expected);
+		if keyframe {
+			self.lost_frames += u64::from(gap);
+			self.pending.retain(|(id, _)| is_newer_frame(*id, frame_id));
+			if self.deliver_to_decoder(codec, true, data, decoder, pli_tx) {
+				self.next_frame_id = Some(frame_id.wrapping_add(1));
+				self.awaiting_keyframe = false;
+				self.last_progress = Instant::now();
+				self.drain_contiguous(decoder, pli_tx);
+			}
+			return;
+		}
+
+		if gap > MAX_REORDER_SLOTS as u32 || self.pending.len() >= MAX_REORDER_SLOTS {
+			self.lost_frames += u64::from(gap);
+			self.pending.clear();
+			self.awaiting_keyframe = true;
+			self.last_progress = Instant::now();
+			let _ = pli_tx.try_send(());
+			return;
+		}
+
+		if !self.pending.iter().any(|(id, _)| *id == frame_id) {
+			self.pending.push((
+				frame_id,
+				PendingVideoFrame {
+					codec,
+					keyframe,
+					data,
+				},
+			));
+		}
+	}
+
+	fn flush_stale(&mut self, decoder: &DecoderQueue, pli_tx: &mpsc::Sender<()>) {
+		if self.decoder_dead
+			|| self.awaiting_keyframe
+			|| self.pending.is_empty()
+			|| self.last_progress.elapsed() < REORDER_TIMEOUT
+		{
+			return;
+		}
+
+		let expected = self.next_frame_id.unwrap_or(0);
+		if let Some((kf_idx, kf_id)) = self
+			.pending
+			.iter()
+			.enumerate()
+			.filter(|(_, (_, f))| f.keyframe)
+			.min_by_key(|(_, (id, _))| id.wrapping_sub(expected))
+			.map(|(i, (id, _))| (i, *id))
+		{
+			self.lost_frames += u64::from(kf_id.wrapping_sub(expected));
+			let (_, kf) = self.pending.swap_remove(kf_idx);
+			self.pending.retain(|(id, _)| is_newer_frame(*id, kf_id));
+			if self.deliver_to_decoder(kf.codec, true, kf.data, decoder, pli_tx) {
+				self.next_frame_id = Some(kf_id.wrapping_add(1));
+				self.last_progress = Instant::now();
+				self.drain_contiguous(decoder, pli_tx);
+			}
+			return;
+		}
+
+		self.lost_frames += 1;
+		self.pending.clear();
+		self.awaiting_keyframe = true;
+		self.last_progress = Instant::now();
+		let _ = pli_tx.try_send(());
+	}
+
+	fn take_feedback(&mut self) -> (u16, u16) {
+		let total = self.total_frames;
+		let recovered = self.fec_recovered_frames;
+		let lost = self.lost_frames;
+		self.total_frames = 0;
+		self.fec_recovered_frames = 0;
+		self.lost_frames = 0;
+		let denom = total.saturating_add(lost);
+		if denom == 0 {
+			return (0, 0);
+		}
+		let loss_pm = ((lost.saturating_mul(1000)) / denom).min(1000) as u16;
+		let fec_pm = ((recovered.saturating_mul(1000)) / denom).min(1000) as u16;
+		(loss_pm, fec_pm)
+	}
 }
 
 /// Connects to a remote `P2pTarget`, validates its pinned cert & auth token, decodes
@@ -925,9 +1345,10 @@ pub async fn run_p2p_viewer_with_call_audio(
 		.open_bi()
 		.await
 		.map_err(|e| format!("Failed to open P2P control stream: {e}"))?;
-	let mut auth_msg = [0u8; 21];
-	auth_msg[..5].copy_from_slice(&AUTH_MAGIC);
+	let mut auth_msg = [0u8; 22];
+	auth_msg[..5].copy_from_slice(&AUTH_MAGIC_V2);
 	auth_msg[5..21].copy_from_slice(&target.token);
+	auth_msg[21] = Codec::local_decode_caps();
 	ctrl_send
 		.write_all(&auth_msg)
 		.await
@@ -991,22 +1412,40 @@ pub async fn run_p2p_viewer_with_call_audio(
 	(wake)();
 
 	let (pli_tx, mut pli_rx) = mpsc::channel::<()>(8);
+	let (feedback_tx, mut feedback_rx) = mpsc::channel::<[u8; 7]>(4);
 	let _ = pli_tx.try_send(());
 
 	let mut tasks = JoinSet::new();
 	tasks.spawn(async move {
-		while pli_rx.recv().await.is_some() {
-			if ctrl_send.write_all(&[CTRL_PLI]).await.is_err() {
-				break;
+		loop {
+			tokio::select! {
+				biased;
+				pli = pli_rx.recv() => {
+					let Some(()) = pli else { break; };
+					if ctrl_send.write_all(&[CTRL_PLI]).await.is_err() {
+						break;
+					}
+				}
+				fb = feedback_rx.recv() => {
+					let Some(msg) = fb else { break; };
+					if ctrl_send.write_all(&msg).await.is_err() {
+						break;
+					}
+				}
 			}
 		}
 	});
 
-	let audio_conn = conn.clone();
-	let audio_stats = stats.clone();
-	let audio_wake = wake.clone();
-	if has_audio {
-		let push_call_frame = |tx: &std::sync::mpsc::SyncSender<crate::PlaybackFrame>, interleaved: &[f32]| {
+	let bytes_rx = Arc::new(AtomicU64::new(0));
+	let fec = Arc::new(Mutex::new(FecAssembler::default()));
+	let gate = Arc::new(Mutex::new(VideoOrderGate::default()));
+
+	let audio_tx = if has_audio {
+		let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+		let audio_stats = stats.clone();
+		let audio_wake = wake.clone();
+		let push_call_frame = |tx: &std::sync::mpsc::SyncSender<crate::PlaybackFrame>,
+		                       interleaved: &[f32]| {
 			for chunk in interleaved.as_chunks::<AUDIO_FRAME_FLOATS>().0 {
 				let mut mono = [0.0f32; AUDIO_FRAME_FRAMES];
 				for (i, pair) in chunk.as_chunks::<2>().0.iter().enumerate() {
@@ -1040,7 +1479,7 @@ pub async fn run_p2p_viewer_with_call_audio(
 			let mut pcm = vec![0.0f32; AUDIO_FRAME_FLOATS * 2];
 			let mut last_seq: Option<u32> = None;
 
-			while let Ok(dgram) = audio_conn.read_datagram().await {
+			while let Some(dgram) = rx.recv().await {
 				let data: &[u8] = &dgram;
 				if data.len() < AUDIO_HEADER_LEN || data[0] != AUDIO_TAG {
 					continue;
@@ -1083,26 +1522,99 @@ pub async fn run_p2p_viewer_with_call_audio(
 				}
 			}
 		});
-	}
+		Some(tx)
+	} else {
+		None
+	};
 
-	let bytes_rx = Arc::new(AtomicU64::new(0));
+	let dgram_conn = conn.clone();
+	let dgram_fec = fec.clone();
+	let dgram_gate = gate.clone();
+	let dgram_decoder = decoder.clone();
+	let dgram_pli = pli_tx.clone();
+	let dgram_bytes = bytes_rx.clone();
+	tasks.spawn(async move {
+		while let Ok(dgram) = dgram_conn.read_datagram().await {
+			let data: &[u8] = &dgram;
+			if data.is_empty() {
+				continue;
+			}
+			match data[0] {
+				AUDIO_TAG => {
+					if let Some(tx) = &audio_tx {
+						let _ = tx.try_send(dgram.to_vec());
+					}
+				}
+				VIDEO_TAG if data.len() > VIDEO_DGRAM_HEADER_LEN => {
+					let frame_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+					let _ts = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
+					let flags = data[9];
+					let keyframe = (flags & 0x01) != 0;
+					let Some(codec) = Codec::from_wire_id((flags >> 1) & 0x07) else {
+						continue;
+					};
+					let data_shards = data[10];
+					let parity_shards = data[11];
+					let shard_idx = data[12];
+					let frame_len =
+						u32::from_be_bytes([data[13], data[14], data[15], data[16]]) as usize;
+					let shard_data = &data[VIDEO_DGRAM_HEADER_LEN..];
+
+					let reconstructed = dgram_fec.lock().ok().and_then(|mut asm| {
+						asm.push_shard(
+							frame_id,
+							data_shards,
+							parity_shards,
+							shard_idx,
+							frame_len,
+							shard_data,
+							P2P_MAX_FRAME_BYTES,
+						)
+					});
+					if let Some(res) = reconstructed {
+						dgram_bytes.fetch_add(res.data.len() as u64, Ordering::Relaxed);
+						if let Ok(mut order) = dgram_gate.lock() {
+							order.push(
+								frame_id,
+								codec,
+								keyframe,
+								res.data,
+								res.fec_recovered,
+								&dgram_decoder,
+								&dgram_pli,
+							);
+						}
+					}
+				}
+				_ => {}
+			}
+		}
+	});
+
 	let latest_gop_stream = Arc::new(AtomicU64::new(0));
 	let stats_conn = conn.clone();
+	let stats_decoder = decoder.clone();
 	let stats_decoder_counters = decoder.counters.clone();
 	let stats_lost = lost.clone();
 	let stats_pli = pli_tx.clone();
+	let stats_feedback = feedback_tx.clone();
+	let stats_gate = gate.clone();
 	let stats_bytes = bytes_rx.clone();
 	let stats_frames = frames_seen.clone();
 	let stats_tx = stats.clone();
 	let stats_wake = wake.clone();
 
 	tasks.spawn(async move {
-		let mut ticker = tokio::time::interval(Duration::from_millis(500));
+		let mut ticker = tokio::time::interval(Duration::from_millis(25));
+		let mut last_feedback = Instant::now();
 		let mut last_tick = Instant::now();
 		loop {
 			ticker.tick().await;
 			if stats_conn.close_reason().is_some() {
 				break;
+			}
+			if let Ok(mut order) = stats_gate.lock() {
+				order.flush_stale(&stats_decoder, &stats_pli);
 			}
 			if let Ok(mut guard) = stats_lost.try_lock()
 				&& !guard.is_empty()
@@ -1110,13 +1622,27 @@ pub async fn run_p2p_viewer_with_call_audio(
 				guard.clear();
 				let _ = stats_pli.try_send(());
 			}
+
+			let rtt_ms = stats_conn.rtt().as_millis().min(9999) as u32;
+			if last_feedback.elapsed() >= Duration::from_millis(500) {
+				last_feedback = Instant::now();
+				let (loss_pm, fec_pm) = stats_gate
+					.lock()
+					.map_or((0, 0), |mut order| order.take_feedback());
+				let mut msg = [0u8; 7];
+				msg[0] = CTRL_FEEDBACK;
+				msg[1..3].copy_from_slice(&(rtt_ms.min(u32::from(u16::MAX)) as u16).to_be_bytes());
+				msg[3..5].copy_from_slice(&loss_pm.to_be_bytes());
+				msg[5..7].copy_from_slice(&fec_pm.to_be_bytes());
+				let _ = stats_feedback.try_send(msg);
+			}
+
 			let elapsed = last_tick.elapsed().as_secs_f64().max(0.1);
 			if elapsed >= 1.0 {
 				let rx = stats_bytes.swap(0, Ordering::Relaxed);
 				let fps_count = stats_frames.swap(0, Ordering::Relaxed);
 				let fps = (f64::from(fps_count) / elapsed).round() as u32;
 				let bitrate_kbps = ((rx as f64 * 8.0) / elapsed / 1000.0).round() as u32;
-				let rtt_ms = stats_conn.rtt().as_millis().min(9999) as u32;
 				let hw = stats_decoder_counters.hardware.load(Ordering::Relaxed) > 0;
 				stats_tx.send_modify(|s| {
 					s.rtt_ms = rtt_ms;
@@ -1140,29 +1666,42 @@ pub async fn run_p2p_viewer_with_call_audio(
 		latest_gop_stream.fetch_max(stream_index, Ordering::AcqRel);
 
 		let decoder = decoder.clone();
+		let fec = fec.clone();
+		let gate = gate.clone();
 		let pli_tx = pli_tx.clone();
 		let bytes_rx = bytes_rx.clone();
 		let latest_gop = latest_gop_stream.clone();
 
 		tasks.spawn(async move {
-			read_gop_stream(stream, stream_index, decoder, pli_tx, bytes_rx, latest_gop).await;
+			read_gop_stream(
+				stream,
+				stream_index,
+				decoder,
+				fec,
+				gate,
+				pli_tx,
+				bytes_rx,
+				latest_gop,
+			)
+			.await;
 		});
 	}
 
 	Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_gop_stream(
 	mut stream: RecvStream,
 	stream_index: u64,
-	decoder: Arc<crate::video_receive::DecoderQueue>,
+	decoder: Arc<DecoderQueue>,
+	fec: Arc<Mutex<FecAssembler>>,
+	gate: Arc<Mutex<VideoOrderGate>>,
 	pli_tx: mpsc::Sender<()>,
 	bytes_rx: Arc<AtomicU64>,
 	latest_gop: Arc<AtomicU64>,
 ) {
-	let mut header = [0u8; 9];
-	let mut awaiting_keyframe = true;
-
+	let mut header = [0u8; VIDEO_STREAM_V2_HEADER_LEN];
 	loop {
 		if latest_gop.load(Ordering::Acquire) > stream_index {
 			let _ = stream.stop(0u32.into());
@@ -1172,8 +1711,13 @@ async fn read_gop_stream(
 			break;
 		}
 		let keyframe = header[0] != 0;
-		let _timestamp = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-		let len = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
+		let Some(codec) = Codec::from_wire_id(header[1]) else {
+			let _ = stream.stop(0u32.into());
+			break;
+		};
+		let frame_id = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
+		let _timestamp = u32::from_be_bytes([header[6], header[7], header[8], header[9]]);
+		let len = u32::from_be_bytes([header[10], header[11], header[12], header[13]]) as usize;
 		if len == 0 || len > P2P_MAX_FRAME_BYTES {
 			let _ = pli_tx.try_send(());
 			let _ = stream.stop(0u32.into());
@@ -1189,23 +1733,14 @@ async fn read_gop_stream(
 			break;
 		}
 		bytes_rx.fetch_add(len as u64, Ordering::Relaxed);
-		if awaiting_keyframe && !keyframe {
-			continue;
+		if let Ok(mut asm) = fec.lock() {
+			asm.mark_completed(frame_id);
 		}
-		awaiting_keyframe = false;
-		let frame = Encoded {
-			codec: Codec::H264,
-			user: 1,
-			data: payload,
-			keyframe,
-		};
-		match offer(&decoder, frame) {
-			Ok(true) => {}
-			Ok(false) => {
-				awaiting_keyframe = true;
-				let _ = pli_tx.try_send(());
+		if let Ok(mut order) = gate.lock() {
+			order.push(frame_id, codec, keyframe, payload, false, &decoder, &pli_tx);
+			if order.decoder_dead {
+				break;
 			}
-			Err(_) => break,
 		}
 	}
 }
@@ -1466,6 +2001,7 @@ mod tests {
 			let ready = Arc::new(AtomicBool::new(false));
 			let keyframe = Arc::new(AtomicBool::new(true));
 			let bitrate = Arc::new(AtomicU32::new(10_000_000));
+			let peer_caps = Arc::new(AtomicU8::new(CAP_H264_BASELINE));
 			let audio_epoch = Arc::new(AtomicU64::new(1));
 
 			let video = Video {
@@ -1482,6 +2018,7 @@ mod tests {
 				ready: ready.clone(),
 				keyframe: keyframe.clone(),
 				bitrate,
+				peer_caps: peer_caps.clone(),
 				audio: None,
 				audio_epoch,
 			};
@@ -1545,7 +2082,7 @@ mod tests {
 			.unwrap_err();
 			assert!(err.contains("token") || err.contains("auth"));
 
-			// 3. Valid target receives decoded video frame with presentation == None.
+			// 3. Valid target receives decoded video frame with presentation == None and negotiates caps.
 			let (decoded_tx, mut decoded_rx) = mpsc::channel::<(u32, u32, bool)>(4);
 			let sink: VideoSink = Arc::new(move |frame| {
 				let _ = decoded_tx.try_send((
@@ -1556,7 +2093,7 @@ mod tests {
 			});
 			let (watch_stats_tx, mut watch_stats_rx) = watch::channel(P2pWatchStats::default());
 			let viewer_task = tokio::spawn(run_p2p_viewer(
-				target,
+				target.clone(),
 				sink,
 				Arc::new(AtomicU16::new(100)),
 				None,
@@ -1574,8 +2111,12 @@ mod tests {
 			})
 			.await
 			.unwrap();
+			assert_eq!(
+				peer_caps.load(Ordering::Acquire),
+				Codec::local_decode_caps()
+			);
 
-			// Feed a real H.264 Annex-B keyframe without opening capture or audio devices.
+			// Feed a real H.264 Annex-B keyframe + P-frame over QUIC FEC datagrams.
 			let cfg = EncoderConfig::new()
 				.bitrate(BitRate::from_bps(2_000_000))
 				.max_frame_rate(FrameRate::from_hz(60.0))
@@ -1607,6 +2148,23 @@ mod tests {
 			assert_eq!((w, h), (320, 180));
 			assert!(no_presentation);
 
+			let rgba2 = vec![180u8; 320 * 180 * 4];
+			yuv.read_rgb8(openh264::formats::BgraSliceU8::new(&rgba2, (320, 180)));
+			let pframe = enc.encode(&yuv).unwrap().to_vec();
+			frame_tx
+				.send(crate::screen::EncodedFrame {
+					data: pframe,
+					timestamp: 180,
+					keyframe: false,
+				})
+				.await
+				.unwrap();
+			let (w2, h2, _) = tokio::time::timeout(Duration::from_secs(5), decoded_rx.recv())
+				.await
+				.unwrap()
+				.unwrap();
+			assert_eq!((w2, h2), (320, 180));
+
 			tokio::time::timeout(Duration::from_secs(2), async {
 				loop {
 					if watch_stats_rx.borrow().state == P2pWatchState::Watching {
@@ -1618,6 +2176,33 @@ mod tests {
 			.await
 			.unwrap();
 			assert_eq!(host_stats_rx.borrow().viewers, 1);
+
+			// 4. Backward-compatible v1 handshake also succeeds.
+			let client_config = build_client_config(target.fingerprint).unwrap();
+			let mut v1_endpoint =
+				Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+			v1_endpoint.set_default_client_config(client_config);
+			let v1_conn = v1_endpoint
+				.connect(
+					SocketAddr::from((Ipv4Addr::LOCALHOST, target.port)),
+					"serein-p2p",
+				)
+				.unwrap()
+				.await
+				.unwrap();
+			let (mut v1_send, mut v1_recv) = v1_conn.open_bi().await.unwrap();
+			let mut v1_auth = [0u8; 21];
+			v1_auth[..5].copy_from_slice(&AUTH_MAGIC_V1);
+			v1_auth[5..21].copy_from_slice(&target.token);
+			v1_send.write_all(&v1_auth).await.unwrap();
+			let mut v1_accept = [0u8; 14];
+			v1_recv.read_exact(&mut v1_accept).await.unwrap();
+			assert_eq!(v1_accept[0], AUTH_OK);
+			// Mixed v2 + v1 viewers intersect down to CAP_H264_BASELINE.
+			assert_eq!(peer_caps.load(Ordering::Acquire), CAP_H264_BASELINE);
+			drop(v1_send);
+			drop(v1_recv);
+			v1_conn.close(0u32.into(), b"done");
 
 			viewer_task.abort();
 			assert!(viewer_task.await.unwrap_err().is_cancelled());
@@ -1631,5 +2216,91 @@ mod tests {
 			assert!(!ready.load(Ordering::Acquire));
 			host_task.abort();
 		});
+	}
+
+	#[test]
+	fn fec_datagrams_and_reorder_gate_recover_losses_and_out_of_order_jumbo_keyframe() {
+		let cfg = EncoderConfig::new()
+			.bitrate(BitRate::from_bps(2_000_000))
+			.max_frame_rate(FrameRate::from_hz(60.0))
+			.rate_control_mode(RateControlMode::Bitrate)
+			.usage_type(UsageType::ScreenContentRealTime)
+			.complexity(Complexity::Low)
+			.intra_frame_period(IntraFramePeriod::from_num_frames(120));
+		let mut enc = H264Encoder::with_api_config(OpenH264API::from_source(), cfg).unwrap();
+		let mut yuv = YUVBuffer::new(320, 180);
+		yuv.read_rgb8(openh264::formats::BgraSliceU8::new(
+			&vec![90u8; 320 * 180 * 4],
+			(320, 180),
+		));
+		enc.force_intra_frame();
+		let idr = enc.encode(&yuv).unwrap().to_vec();
+		yuv.read_rgb8(openh264::formats::BgraSliceU8::new(
+			&vec![150u8; 320 * 180 * 4],
+			(320, 180),
+		));
+		let pframe = enc.encode(&yuv).unwrap().to_vec();
+
+		let decoded = Arc::new(AtomicU32::new(0));
+		let decoded_cb = decoded.clone();
+		let sink: VideoSink = Arc::new(move |_| {
+			decoded_cb.fetch_add(1, Ordering::Relaxed);
+		});
+		let (decoder, _lost) = spawn_p2p_decoder(sink).unwrap();
+		let (pli_tx, mut pli_rx) = mpsc::channel(4);
+
+		let mut asm = FecAssembler::default();
+		let mut gate = VideoOrderGate::default();
+
+		// P-frame 2 arrives over FEC datagrams (with shard 0 dropped) BEFORE jumbo keyframe 1!
+		let p_block = encode_frame(&pframe, 200, DEFAULT_FEC_PERCENT).unwrap();
+		let mut reconstructed_p = None;
+		for (idx, shard) in p_block.shards.iter().enumerate().skip(1) {
+			if let Some(res) = asm.push_shard(
+				2,
+				p_block.data_shards,
+				p_block.parity_shards,
+				idx as u8,
+				p_block.frame_len,
+				shard,
+				P2P_MAX_FRAME_BYTES,
+			) {
+				reconstructed_p = Some(res);
+				break;
+			}
+		}
+		let reconstructed_p = reconstructed_p.expect("FEC should recover dropped shard 0");
+		assert!(reconstructed_p.fec_recovered);
+
+		// First frame 1 (keyframe) arrives via uni-stream, then out-of-order P-frame 2,
+		// and also test P-frame 3 arriving BEFORE P-frame 2 settles:
+		gate.push(1, Codec::H264, true, idr, false, &decoder, &pli_tx);
+		gate.push(
+			3,
+			Codec::H264,
+			false,
+			reconstructed_p.data.clone(),
+			false,
+			&decoder,
+			&pli_tx,
+		);
+		// Frame 3 must be buffered (not trigger PLI) waiting for frame 2.
+		assert!(pli_rx.try_recv().is_err());
+		gate.push(
+			2,
+			Codec::H264,
+			false,
+			reconstructed_p.data,
+			reconstructed_p.fec_recovered,
+			&decoder,
+			&pli_tx,
+		);
+		assert!(pli_rx.try_recv().is_err());
+
+		let deadline = Instant::now() + Duration::from_secs(2);
+		while decoded.load(Ordering::Relaxed) < 3 && Instant::now() < deadline {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		assert_eq!(decoded.load(Ordering::Relaxed), 3);
 	}
 }

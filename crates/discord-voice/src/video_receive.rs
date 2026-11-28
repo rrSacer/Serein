@@ -953,6 +953,7 @@ impl Backend {
 		Self::new_timed(
 			Codec::H264,
 			prefer_hardware,
+			MAX_FRAME_BYTES,
 			user,
 			sink,
 			counters,
@@ -960,9 +961,11 @@ impl Backend {
 			Arc::default(),
 		)
 	}
+	#[allow(clippy::too_many_arguments)]
 	fn new_timed(
 		codec: Codec,
 		prefer_hardware: bool,
+		max_access_unit: usize,
 		user: u64,
 		sink: &VideoSink,
 		counters: &Arc<DecoderCounters>,
@@ -998,16 +1001,24 @@ impl Backend {
 			if codec != Codec::H264 {
 				#[cfg(target_os = "linux")]
 				return (if codec == Codec::Av1 {
-					platform::video::live::H264Decoder::new_av1_timed(deliver)
+					platform::video::live::H264Decoder::new_av1_timed_with_limit(
+						deliver,
+						max_access_unit,
+					)
 				} else {
-					platform::video::live::H264Decoder::new_h265_timed(deliver)
+					platform::video::live::H264Decoder::new_h265_timed_with_limit(
+						deliver,
+						max_access_unit,
+					)
 				})
 				.ok()
 				.map(Self::Hardware);
 				#[cfg(not(target_os = "linux"))]
 				return None;
 			}
-			if let Ok(decoder) = platform::video::live::H264Decoder::new_timed(deliver) {
+			if let Ok(decoder) =
+				platform::video::live::H264Decoder::new_timed_with_limit(deliver, max_access_unit)
+			{
 				return Some(Self::Hardware(decoder));
 			}
 		}
@@ -1288,6 +1299,7 @@ impl Worker {
 			let Some(backend) = Backend::new_timed(
 				frame.codec,
 				self.prefer_hardware && !participant.software_only,
+				self.max_frame_bytes,
 				user,
 				&self.sink,
 				counters,

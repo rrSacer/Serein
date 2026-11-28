@@ -43,14 +43,15 @@
 
 ## 🚀 Serein P2P — Transmissão de Tela Direta (QUIC / Tailscale / LAN)
 
-Esta versão customizada do Serein integra transmissão de tela **direta P2P via QUIC** de alta fidelidade e baixíssima latência, contornando limitações de rota/região da infraestrutura de mídia do Discord e dispensando restrições de permissão `STREAM` ou assinaturas Nitro.
+Esta versão customizada do Serein integra transmissão de tela **direta P2P via QUIC** com transporte inspirado em **Sunshine/Moonlight**, contornando limitações de rota/região da infraestrutura de mídia do Discord e dispensando restrições de permissão `STREAM` ou assinaturas Nitro.
 
 ### ✨ Destaques do P2P
-- **Transporte QUIC Criptografado**: Streaming direto ponto a ponto com autenticação por token de sessão e pinning de certificado TLS efêmero via [Quinn](https://github.com/quinn-rs/quinn).
-- **Desempenho Gamer**: Suporte a resoluções nativas (720p, 1080p, 1440p, 4K ou fonte), taxas de quadros de **15 até 165 fps** e presets de bitrate de até **60 Mbps**.
+- **Transporte Estilo Sunshine/Moonlight**: QUIC com controle de congestionamento **BBR**, descoberta automática de MTU (**PMTUD**), entrega por datagramas com **FEC Reed-Solomon (Cauchy GF(2⁸))** para recuperação de pacotes sem *Head-of-Line blocking*, fallback automático via uni-stream para keyframes grandes e controle adaptativo de bitrate por telemetria (RTT/perda).
+- **Auto-Bitrate do Moonlight + até 150 Mbps**: O modo padrão **Auto (Moonlight)** calcula a taxa de bits ideal pela resolução e FPS (360p → 4K, 15 → 165 fps, até **150 Mbps**), com presets manuais de 8 a 150 Mbps, H.264 **High Profile** e **VBR**.
+- **Suporte Completo Sem Codec de Hardware**: Funciona de ponta a ponta mesmo em PCs sem GPU/codec dedicado (VA-API/NVENC) e sem `gst-plugins-bad` ou `gst-libav` — com captura via `x264enc`, importação OpenGL (`SoftwareGl`) + **OpenH264 embutido** e negociação automática de perfil (High ↔ Constrained Baseline) por espectador.
 - **Interface 100% Nativa**: Integrado diretamente no diálogo padrão de compartilhamento (*"Compartilhe sua tela"*), no palco de voz nativo do Serein e no player de chamada.
-- **Convite Automático no Chat**: Envia o link `serein-p2p://` no canal da chamada quando você começa a transmitir e apaga a mensagem automaticamente ao parar.
-- **Compatível com Tailscale**: Conecte-se com seus amigos em redes virtuais como [Tailscale](https://tailscale.com/) ou pela rede local (LAN).
+- **Convite Automático no Chat**: A opção **"Enviar convite no chat da call"** publica o link `serein-p2p://` no chat do canal da chamada para entrada com 1 clique e remove a mensagem automaticamente ao encerrar.
+- **Compatível com Tailscale**: Conecte-se diretamente com seus amigos em redes virtuais como [Tailscale](https://tailscale.com/) ou pela rede local (LAN).
 
 ### 📦 Instalação Rápida (Linux x86_64)
 
@@ -68,7 +69,7 @@ cd serein-linux-x86_64-p2p
 ./install.sh
 ```
 
-O script instala o executável em `~/.local/share/serein-p2p/serein` e cria o atalho no menu com o nome **Serein P2P**. O Serein original não é modificado.
+O script instala o executável em `~/.local/share/serein-p2p/serein`, verifica os plugins base do PipeWire/GStreamer e cria o atalho no menu com o nome **Serein P2P**. O Serein original não é modificado.
 
 ---
 
