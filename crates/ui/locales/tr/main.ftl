@@ -901,6 +901,8 @@ emoji-picker-search-emoji = Mükemmel emojiyi bulun
 # Context: popup
 emoji-picker-search-emoji-label = Emojiyi ada göre ara
 # Context: popup
+emoji-picker-search-favorites = Favorilerde ara
+emoji-picker-search-favorites-label = Favori GIF'lerde ara
 emoji-picker-search-gifs-label = KLIPY'de GIF arayın
 # Context: popup
 emoji-picker-search-klipy = KLIPY'de ara
@@ -4310,6 +4312,10 @@ voice-voice-processing-controls-only-transmit-sound-above-this-level-lower-value
 voice-voice-processing-controls-open-microphone-mute-and-push-to-talk-still-apply = Mikrofonu açın. Sessize alma ve bas-konuş hâlâ geçerlidir.
 # Context: voice_processing_controls
 voice-voice-processing-controls-push-to-talk = Konuşmak için bas
+# Context: voice_processing_controls
+voice-voice-processing-controls-confirm-before-switching-calls = Arama değiştirmeden önce onay iste
+# Context: voice_processing_controls
+voice-voice-processing-controls-ask-before-leaving-your-current-call-to-join-another = Başka bir aramaya katılmak için mevcut aramadan ayrılmadan önce sor.
 # Context: voice_processing_controls
 voice-voice-processing-controls-reduce-speaker-audio-picked-up-by-your-microphone = Mikrofonunuzun aldığı hoparlör sesini azaltın.
 # Context: voice_processing_controls

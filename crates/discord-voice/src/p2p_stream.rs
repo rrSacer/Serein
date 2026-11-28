@@ -1469,6 +1469,7 @@ mod tests {
 			let audio_epoch = Arc::new(AtomicU64::new(1));
 
 			let video = Video {
+				max_bitrate: 10_000_000,
 				settings: client_core::screen::Settings {
 					source: client_core::screen::SourceId::Display(1),
 					width: 320,

@@ -1092,6 +1092,7 @@ fn friend_button(ui: &mut egui::Ui, state: &State, user: &User, compact: bool) -
 				icons::atom(icon, 18.0, text),
 				RichText::new(crate::i18n::translate(label))
 					.strong()
+					.family(design::ink_family(ui, design::Weight::Medium, text, fill))
 					.color(text),
 			))
 			.fill(fill)
@@ -2983,6 +2984,10 @@ pub struct ProfileSession {
 	pub(crate) own_status: String,
 	/// Why no call can start this frame, whichever channel; set by the view before drawing.
 	pub(crate) calls_blocked: Option<&'static str>,
+	/// An image viewer is drawn over the card this frame. The view sets it before drawing: the
+	/// card runs before the viewer, so without it the viewer's click-away press and Escape would
+	/// also dismiss the card beneath.
+	pub(crate) viewer_open: bool,
 	open: Option<User>,
 	anchor: Option<(Id, Pos2)>,
 	trigger: Option<Rect>,
@@ -3174,6 +3179,7 @@ impl ProfileSession {
 		self.badges.close();
 		self.reset_card_input();
 		self.full = false;
+		self.viewer_open = false;
 		self.note_requested = None;
 		self.open = None;
 		self.anchor = None;
@@ -4678,6 +4684,12 @@ fn card_view(
 							[ui.available_width(), 32.0],
 							egui::Button::new(
 								RichText::new(crate::i18n::translate("profiles-show-edit-profile"))
+									.family(design::ink_family(
+										ui,
+										design::Weight::Medium,
+										colors.accent_text,
+										colors.accent,
+									))
 									.color(colors.accent_text),
 							)
 							.fill(colors.accent)
@@ -4957,6 +4969,8 @@ fn card_view(
 			.then(|| i.pointer.interact_pos())
 			.flatten()
 	});
+	let viewer_open = session.viewer_open;
+	let pressed = pressed.filter(|_| !viewer_open);
 	let in_panel = |pos: Pos2| panel.is_some_and(|panel| panel.contains(pos));
 	let in_badges = |pos: Pos2| badge_rects.iter().any(|r: &Rect| r.contains(pos));
 	// Clicking outside a badge menu closes the menu, not the card beneath it.
@@ -4973,6 +4987,7 @@ fn card_view(
 	}
 	// Escape closes the side panel before the card.
 	let panel_escape = mutuals.is_some()
+		&& !viewer_open
 		&& ui
 			.ctx()
 			.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
@@ -4987,6 +5002,7 @@ fn card_view(
 	});
 	// Escape closes an open badge menu before the card.
 	let badge_escape = badge_panels
+		&& !viewer_open
 		&& !panel_escape
 		&& ui
 			.ctx()
@@ -4995,6 +5011,7 @@ fn card_view(
 		session.badges.close_top();
 	}
 	let escape = !docked
+		&& !viewer_open
 		&& opening.is_none()
 		&& !menu_open
 		&& !panel_escape

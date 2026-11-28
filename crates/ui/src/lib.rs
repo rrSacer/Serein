@@ -18,7 +18,7 @@ mod resample;
 #[cfg(feature = "demo")]
 pub use avatars::media::debug_heic_layout_check;
 pub use avatars::media::{Lane, MAX_FRAMES, Motion, Rendition, Size, fit_edge, is_motion_video};
-pub use avatars::{EFFECT_EDGE, EMBED_EDGE, FRAME_EDGE, GifFrames};
+pub use avatars::{EFFECT_EDGE, EMBED_EDGE, FRAME_EDGE, GifFrames, is_hover_animated_key};
 mod categories;
 #[cfg(feature = "demo")]
 pub use categories::debug_thread_navigation_check;
@@ -396,6 +396,8 @@ pub struct MessagingUi {
 	/// An image cache partition the owner asked to empty; the desktop consumes it.
 	pub clear_image_cache: Option<model::CachePartition>,
 	pub hide_title_bar: bool,
+	/// Active graphics driver requires the native OS title bar for this launch (not persisted).
+	pub native_title_bar_required: bool,
 	pub hide_window_decorations: bool,
 	pub custom_title_bar: bool,
 	pub custom_font: fonts::Settings,
@@ -586,6 +588,9 @@ pub struct MessagingUi {
 	/// The running call or microphone test moved automatic suppression to RNNoise.
 	pub voice_suppression_fell_back: bool,
 	pub voice_push_to_talk: bool,
+	/// Inverse of the saved "confirm before switching calls" setting, so a default-constructed
+	/// view keeps asking.
+	pub skip_call_switch_confirmation: bool,
 	/// Device-local voice intent, retained between calls and restarts.
 	pub voice_muted: bool,
 	pub voice_deafened: bool,
@@ -1451,6 +1456,25 @@ impl MessagingUi {
 	pub fn take_avatar_requests(&mut self) -> Vec<String> {
 		self.avatars.take_requests()
 	}
+	pub fn begin_animation_pass(&mut self, pass: u64, paint_only: bool) {
+		self.avatars.begin_pass(pass, paint_only);
+	}
+	pub fn has_active_animations(&self) -> bool {
+		self.avatars.has_active_animations()
+	}
+	pub fn take_animation_paint_only(&mut self) -> Option<std::time::Duration> {
+		self.avatars.take_paint_only_delay()
+	}
+	pub fn paint_only_animations(
+		&mut self,
+		ctx: &egui::Context,
+		update: impl FnMut(egui::TextureId, &egui::ColorImage) -> bool,
+	) -> (bool, Option<std::time::Duration>) {
+		self.avatars.paint_only_animations(ctx, update)
+	}
+	pub fn take_freed_memory_bytes(&mut self) -> usize {
+		self.avatars.take_freed_bytes()
+	}
 	/// Next idle animation/inline texture release; see `take_avatar_requests`.
 	pub fn avatar_release_at(&self) -> Option<std::time::Instant> {
 		self.avatars.next_release()
@@ -1500,6 +1524,7 @@ impl MessagingUi {
 			startup_graphics_api: self.startup_graphics_api,
 			available_graphics_apis: std::mem::take(&mut self.available_graphics_apis),
 			graphics_api_env_override: self.graphics_api_env_override,
+			native_title_bar_required: self.native_title_bar_required,
 			// G-SYNC belongs to the device, and the desktop hands its finding over only once.
 			gsync_detected: self.gsync_detected,
 			..Self::default()
@@ -2584,9 +2609,10 @@ impl MessagingUi {
 			.show(ui, |ui| {
 				let ctx = ui.ctx().clone();
 				if self.guild.is_none() {
-					// Search and Friends share one row; Friends is the compact glyph beside it.
+					// Search and Friends share one row at the control height; Friends is the square beside it.
 					ui.horizontal(|ui| {
 						ui.spacing_mut().item_spacing.x = 6.0;
+						let side = ui.spacing().interact_size.y.max(30.0);
 						let find = ui
 							.add_enabled_ui(
 								!self.ime_active
@@ -2597,8 +2623,11 @@ impl MessagingUi {
 											.any(|event| matches!(event, egui::Event::Ime(_)))
 									}),
 								|ui| {
+									// The label centres itself, so without vertical padding the
+									// button is exactly `side` tall, like the Friends square.
+									ui.spacing_mut().button_padding.y = 0.0;
 									ui.add_sized(
-										[(ui.available_width() - 36.0).max(60.0), 30.0],
+										[(ui.available_width() - side - 6.0).max(60.0), side],
 										egui::Button::new(language.text("find-conversation"))
 											.truncate(),
 									)
@@ -2618,12 +2647,12 @@ impl MessagingUi {
 						}
 						let friends = state.selected.is_none();
 						let (rect, response) =
-							ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click());
+							ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
 						let hovered = response.hovered() || response.has_focus();
 						if friends || hovered {
 							ui.painter().rect_filled(
 								rect,
-								6,
+								ui.visuals().widgets.inactive.corner_radius,
 								if friends {
 									colors.selected
 								} else {
@@ -2634,7 +2663,7 @@ impl MessagingUi {
 						icons::paint(
 							ui.painter(),
 							icons::Icon::People,
-							rect.shrink(7.0),
+							rect.shrink(side * (7.0 / 30.0)),
 							if friends || hovered {
 								colors.text_strong
 							} else {
@@ -3639,11 +3668,15 @@ impl MessagingUi {
 				let button = |ui: &mut egui::Ui, label: String, fill, text| {
 					ui.add_enabled(
 						enabled,
-						egui::Button::new(design::medium(ui, &label, 14.0).color(text))
-							.fill(fill)
-							.stroke(egui::Stroke::NONE)
-							.corner_radius(6)
-							.min_size(egui::vec2(88.0, 32.0)),
+						egui::Button::new(
+							design::medium(ui, &label, 14.0)
+								.family(design::ink_family(ui, design::Weight::Medium, text, fill))
+								.color(text),
+						)
+						.fill(fill)
+						.stroke(egui::Stroke::NONE)
+						.corner_radius(6)
+						.min_size(egui::vec2(88.0, 32.0)),
 					)
 					.clicked()
 				};
@@ -4984,11 +5017,16 @@ impl MessagingUi {
 			.hline(line, y, egui::Stroke::new(1.0, colors.border));
 		ui.add_space(6.0);
 	}
+	/// Whether the native OS title bar is active for this session, either from the owner's
+	/// preference or because the active graphics driver requires it.
+	pub fn uses_native_title_bar(&self) -> bool {
+		self.hide_title_bar || self.native_title_bar_required
+	}
 	fn shows_title_bar(&self) -> bool {
 		if cfg!(target_os = "linux") {
 			self.uses_custom_title_bar()
 		} else {
-			!self.hide_title_bar
+			!self.uses_native_title_bar()
 		}
 	}
 	/// Linux only: Serein draws its own GTK 4 style header bar instead of the system one.
@@ -5081,6 +5119,7 @@ impl MessagingUi {
 		#[cfg(feature = "demo")]
 		let cached = cached.filter(|_| !self.avatars.hold_demo_images);
 		self.dm_profile.calls_blocked = self.calls_unavailable(state);
+		self.dm_profile.viewer_open = self.profile_image.is_some();
 		let mut action = None;
 		// The panel shares the conversation surface, so the card floats on the chat itself.
 		egui::Panel::right("dm-profile-pane")
@@ -5170,7 +5209,6 @@ impl MessagingUi {
 						grid,
 					}),
 				});
-				self.profile.close();
 			}
 			profiles::Action::Banner(media) => {
 				let ext = media
@@ -5193,7 +5231,6 @@ impl MessagingUi {
 					},
 					floor: attachments::Floor::Fit,
 				});
-				self.profile.close();
 			}
 			profiles::Action::AddFriend(id) => {
 				if let Some(command) = state.add_profile_friend(id) {
@@ -5346,6 +5383,7 @@ impl MessagingUi {
 	/// Draws one frame of the signed-in client and returns the commands it produced for the
 	/// service layer.
 	pub fn show(&mut self, ui: &mut egui::Ui, state: &mut State) -> Vec<Command> {
+		self.avatars.sync_pass(ui.ctx().cumulative_pass_nr());
 		self.clear_inactive_composer_undo(ui.ctx(), state.generation, state.selected);
 		interface_tweaks::publish(ui.ctx(), &self.interface_tweaks);
 		rtl::scope(
@@ -5510,7 +5548,9 @@ impl MessagingUi {
 		}
 		if self.server_settings.is_open() {
 			self.extensions.stop_theme_preview(&ctx);
+			// An open image viewer owns Escape; it runs later this frame.
 			if self.profile.open_user().is_some()
+				&& self.profile_image.is_none()
 				&& ctx
 					.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
 			{
@@ -6839,6 +6879,8 @@ impl MessagingUi {
 			let anchor = self.profile.anchor_or_place(&ctx, user.id);
 			self.profile.ingest_opener_rect(&ctx);
 			self.profile.calls_blocked = self.calls_unavailable(state);
+			// The viewer opens over the card and closing it returns here.
+			self.profile.viewer_open = self.profile_image.is_some();
 			let action = profiles::show_with_session(
 				ui,
 				&user,
@@ -8696,6 +8738,145 @@ mod composer_tests {
 		// With the viewer closed, Escape returns to the search it was covering.
 		frame(&mut view, &mut state, vec![edit_key(egui::Key::Escape)]);
 		assert!(!view.search.open);
+	}
+
+	#[test]
+	fn profile_image_viewer_dismissal_keeps_the_card_open() {
+		let ctx = egui::Context::default();
+		let mut state = edit_state();
+		let user = model::User {
+			id: Id(2),
+			name: "Sam".into(),
+			avatar: None,
+			webhook: false,
+			kind: Default::default(),
+			discriminator: 0,
+			username: None,
+			primary_guild: None,
+			cosmetics: None,
+		};
+		let mut view = MessagingUi::default();
+		let frame = |view: &mut MessagingUi, state: &mut State, events| {
+			ctx.run_ui(
+				egui::RawInput {
+					screen_rect: Some(egui::Rect::from_min_size(
+						egui::Pos2::ZERO,
+						egui::vec2(1000.0, 700.0),
+					)),
+					events,
+					..Default::default()
+				},
+				|ui| {
+					view.show(ui, state);
+				},
+			)
+			.drop_without_applying_deltas();
+		};
+		let settle = |view: &mut MessagingUi, state: &mut State| {
+			for _ in 0..3 {
+				frame(view, state, vec![]);
+			}
+		};
+		let open_image = |view: &mut MessagingUi, state: &mut State, banner: bool| {
+			let media = model::EmbedMedia {
+				url: Some("https://cdn.example/image.png".into()),
+				width: 128,
+				height: 128,
+				..Default::default()
+			};
+			let user = view.profile.open_user().cloned().unwrap();
+			let action = if banner {
+				profiles::Action::Banner(media)
+			} else {
+				profiles::Action::Avatar {
+					media,
+					points: 128.0,
+					grid: attachments::PixelGrid::Declared,
+				}
+			};
+			view.profile_action(&ctx, state, &mut Vec::new(), &user, None, action);
+			settle(view, state);
+			assert!(view.profile_image.is_some());
+		};
+		let away = egui::pos2(40.0, 660.0);
+		let button = |pressed| egui::Event::PointerButton {
+			pos: away,
+			button: egui::PointerButton::Primary,
+			pressed,
+			modifiers: egui::Modifiers::NONE,
+		};
+		let card_open = |view: &MessagingUi| view.profile.open_user().is_some();
+		let escape = || vec![edit_key(egui::Key::Escape)];
+
+		view.preview_profile_popout(user.clone());
+		settle(&mut view, &mut state);
+		assert!(card_open(&view));
+
+		// Opening the picture leaves the card under the viewer.
+		open_image(&mut view, &mut state, false);
+		assert!(card_open(&view), "the card outlives opening");
+
+		// Click-away: the press lands while the viewer is open and the release closes it.
+		frame(&mut view, &mut state, vec![egui::Event::PointerMoved(away)]);
+		frame(&mut view, &mut state, vec![button(true)]);
+		assert!(card_open(&view), "the press is the viewer's");
+		frame(&mut view, &mut state, vec![button(false)]);
+		assert!(view.profile_image.is_none(), "click-away closes the viewer");
+		settle(&mut view, &mut state);
+		assert!(card_open(&view), "the card is back to read");
+
+		// Escape closes the viewer first and the card on its next press.
+		open_image(&mut view, &mut state, false);
+		frame(&mut view, &mut state, escape());
+		assert!(view.profile_image.is_none(), "Escape closes the viewer");
+		assert!(card_open(&view), "Escape stops at the viewer");
+
+		// Normal dismissal is restored: banner, then an outside click closes the card.
+		open_image(&mut view, &mut state, true);
+		frame(&mut view, &mut state, escape());
+		assert!(view.profile_image.is_none() && card_open(&view));
+		settle(&mut view, &mut state);
+		frame(&mut view, &mut state, vec![button(true)]);
+		assert!(!card_open(&view), "an outside click closes the card again");
+
+		// The full profile is a modal under the viewer: Escape closes only the viewer.
+		view.preview_full_profile(user.clone());
+		settle(&mut view, &mut state);
+		open_image(&mut view, &mut state, false);
+		frame(&mut view, &mut state, escape());
+		assert!(view.profile_image.is_none(), "Escape reaches the viewer");
+		assert!(card_open(&view), "the full profile stays");
+		settle(&mut view, &mut state);
+		frame(&mut view, &mut state, escape());
+		assert!(!card_open(&view), "the next Escape closes the full profile");
+
+		// Server settings intercept Escape for the card behind them; the viewer still wins.
+		state.guilds.push(model::Guild {
+			banner: None,
+			id: Id(100),
+			name: "Synthetic server".into(),
+			icon: None,
+			emojis: None,
+			stickers: None,
+			default_message_notifications: None,
+		});
+		state.permissions.guilds.insert(
+			Id(100),
+			model::permissions::Guild {
+				id: Id(100),
+				owner: Some(Id(1)),
+				roles: None,
+				member: None,
+			},
+		);
+		let _ = view.preview_server_settings(&mut state, Id(100));
+		view.preview_profile_popout(user);
+		settle(&mut view, &mut state);
+		assert!(view.server_settings.is_open() && card_open(&view));
+		open_image(&mut view, &mut state, false);
+		frame(&mut view, &mut state, escape());
+		assert!(view.profile_image.is_none(), "Escape closes the viewer");
+		assert!(card_open(&view), "Escape does not reach the card");
 	}
 
 	#[test]
