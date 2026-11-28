@@ -41,9 +41,6 @@
 
 ---
 
-
----
-
 ## 🚀 Serein P2P — Transmissão de Tela Direta (QUIC / Tailscale / LAN)
 
 Esta versão customizada do Serein integra transmissão de tela **direta P2P via QUIC** de alta fidelidade e baixíssima latência, contornando limitações de rota/região da infraestrutura de mídia do Discord e dispensando restrições de permissão `STREAM` ou assinaturas Nitro.
@@ -61,7 +58,7 @@ Para instalar mantendo seu Serein oficial intacto e adicionando o atalho **Serei
 
 ```sh
 # Baixe a release mais recente e execute o instalador:
-curl -fsSL https://raw.githubusercontent.com/rrSacer/Serein/feat/direct-screen-p2p/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rrSacer/Serein/main/install.sh | bash
 ```
 
 Ou baixe o arquivo `serein-linux-x86_64-p2p.tar.gz` na página de [Releases](https://github.com/rrSacer/Serein/releases), descompacte e execute:
